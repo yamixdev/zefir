@@ -1,0 +1,80 @@
+on:
+  #push:
+  #  - workflows: deploy-tg-bot-workflow
+  #    filter: 
+  #      branches: ["master", "main"]
+  pull_request:
+    - workflows: deploy-tg-bot-workflow
+      filter:
+        source_branches: ["**", "!test**"]
+        target_branches: "main"
+
+tokens:
+  SERVICE_CONNECTION_WITH_TOKEN:
+    service_connection: "default-service-connection"
+    scope: org
+
+workflows:
+  deploy-tg-bot-workflow:
+    inputs:
+      bot-username:
+        type: string #- name: Field does not match the pattern /|[a-z][-a-z0-9]{1,61}[a-z0-9]/
+        required: true
+        description: Your Telegram bot username without _bot from BotFather. Name must match the pattern /|[a-z][-a-z0-9]{1,61}[a-z0-9]/
+      bot-token:
+        type: string
+        default: "YOUR_TG_BOT_TOKEN"
+        description: Your Telegram bot token from BotFather
+    env:
+      YC_BOT_NAME: ${{ inputs.bot-username }}
+      TG_BOT_TOKEN: ${{ inputs.bot-token }}
+    tasks:
+      - name: deploy-tg-backend-task
+        cubes: 
+          - name: format-name
+            script:
+              - |
+                func_name=$(echo "$YC_BOT_NAME" | tr '[:upper:]' '[:lower:]' | tr -d '_')
+                echo "function_name=$func_name" >> $SOURCECRAFT_OUTPUT
+                
+          - name: deploy-func
+            env:
+              ID_TOKEN: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.id_token }}
+              YC_SA_ID: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.service_account_id }}  
+              YC_FOLDER_ID: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.folder_id }} 
+              YC_FUNCTION_NAME: ${{ cubes.format-name.outputs.function_name }}
+              YC_FUNCTION_RUNTIME: nodejs22
+              YC_FUNCTION_ENTRYPOINT: index.handler
+              SOURCE_PATH: "./src"
+              ENVIRONMENT: "BOT_TOKEN=${{ inputs.bot-token }}"
+              PUBLIC: true
+            image: cr.yandex/sourcecraft/yc-function:latest
+
+          - name: register-with-botfather
+            env:
+              TG_BOT_TOKEN: ${{ inputs.bot-token }}
+            script:
+              - |
+                # Check if TG_BOT_TOKEN is set and not equal to placeholder
+                if [ -n "$TG_BOT_TOKEN" ] && [ "$TG_BOT_TOKEN" != "YOUR_TG_BOT_TOKEN" ]; then
+                    echo "TG_BOT_TOKEN is properly set"
+                    echo "Setting webhook..."
+                    curl --request POST --url https://api.telegram.org/bot$TG_BOT_TOKEN/setWebhook?url=${{cubes.deploy-func.outputs.invoke_url}}
+                    echo "Webhook set!"
+                else
+                    echo "TG_BOT_TOKEN is either not set or equals placeholder value"
+                fi
+
+          - name: get-outputs
+            script:
+              - |
+                echo "invoke_url=${{ cubes.deploy-func.outputs.invoke_url }}"
+                echo "deployment_location=${{ cubes.deploy-func.outputs.deployment_location }}"
+                echo "invoke_url=${{ cubes.deploy-func.outputs.invoke_url }}" > invoke_url.txt
+                echo "deployment_location=${{ cubes.deploy-func.outputs.deployment_location }}" > deployment_location.txt
+            artifacts:
+              paths:
+                - invoke_url.txt
+                - deployment_location.txt
+
+            
