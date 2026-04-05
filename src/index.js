@@ -3,8 +3,8 @@ const axios = require('axios');
 require('dotenv').config();
 
 // Конфигурация
-const ADMIN_ID = process.env.ADMIN_ID ? parseInt(process.env.ADMIN_ID) : null; // ID админа в Telegram
-const YANDEX_WEATHER_API_KEY = process.env.YANDEX_WEATHER_API_KEY || ''; // Ключ API Яндекс Погоды
+const ADMINS = process.env.ADMINS ? process.env.ADMINS.split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id)) : [];
+const YANDEX_WEATHER_API_KEY = process.env.YANDEX_WEATHER_API_KEY || '';
 
 // Хранилище для сообщений пользователей (в реальном приложении используйте БД)
 const userMessages = new Map(); // chatId -> { messages: [], username, firstName, lastName }
@@ -13,6 +13,11 @@ const adminReplies = new Map(); // messageId -> { userId, originalMessage }
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // ==================== УТИЛИТЫ ====================
+
+// Проверка, является ли пользователь админом
+function isAdmin(userId) {
+  return ADMINS.includes(userId);
+}
 
 // Получить информацию о пользователе
 function getUserInfo(ctx) {
@@ -39,6 +44,18 @@ function formatMessageForAdmin(userInfo, messageText, chatId) {
 // Форматирование ответа админа для пользователя
 function formatReplyForUser(adminMessage) {
   return `📩 *ОТВЕТ ОТ АДМИНИСТРАТОРА:*\n\n${adminMessage}`;
+}
+
+// Отправить уведомление всем админам
+async function notifyAdmins(message, options = {}) {
+  const promises = ADMINS.map(adminId => {
+    return bot.telegram.sendMessage(adminId, message, options).catch(err => {
+      console.error(`Ошибка отправки уведомления админу ${adminId}:`, err.message);
+      return null;
+    });
+  });
+  
+  return Promise.all(promises);
 }
 
 // ==================== КОМАНДА ПОГОДЫ ====================
@@ -168,10 +185,9 @@ bot.start((ctx) => {
   
   ctx.reply(welcomeMessage, { parse_mode: 'Markdown' });
   
-  // Уведомляем админа о новом пользователе
-  if (ADMIN_ID) {
-    bot.telegram.sendMessage(
-      ADMIN_ID,
+  // Уведомляем админов о новом пользователе
+  if (ADMINS.length > 0) {
+    notifyAdmins(
       `🆕 *НОВЫЙ ПОЛЬЗОВАТЕЛЬ ЗАПУСТИЛ БОТА*\n\n` +
       `👤 ${userInfo.fullName}\n` +
       `🔖 @${userInfo.username}\n` +
@@ -277,13 +293,12 @@ bot.on('text', async (ctx) => {
     { parse_mode: 'Markdown' }
   );
   
-  // Уведомляем админа
-  if (ADMIN_ID) {
+  // Уведомляем админов
+  if (ADMINS.length > 0) {
     try {
       const adminMessage = formatMessageForAdmin(userInfo, messageText, chatId);
       
-      const adminReply = await bot.telegram.sendMessage(
-        ADMIN_ID,
+      const adminReplies = await notifyAdmins(
         adminMessage,
         {
           parse_mode: 'Markdown',
@@ -305,24 +320,29 @@ bot.on('text', async (ctx) => {
       );
       
       // Сохраняем связь между сообщением админа и пользователем
-      adminReplies.set(adminReply.message_id, {
-        userId: userInfo.id,
-        originalMessage: messageText,
-        userMessageId: messageId,
-        userChatId: chatId
+      adminReplies.forEach((adminReply, index) => {
+        if (adminReply) {
+          adminRepliesMap.set(adminReply.message_id, {
+            userId: userInfo.id,
+            originalMessage: messageText,
+            userMessageId: messageId,
+            userChatId: chatId,
+            adminId: ADMINS[index]
+          });
+        }
       });
       
     } catch (error) {
-      console.error('Ошибка отправки уведомления админу:', error);
-      ctx.reply('⚠️ *Внимание:* Админ временно недоступен. Ваше сообщение сохранено.');
+      console.error('Ошибка отправки уведомления админам:', error);
+      ctx.reply('⚠️ *Внимание:* Админы временно недоступны. Ваше сообщение сохранено.');
     }
   } else {
-    console.warn('ADMIN_ID не настроен. Уведомления не отправляются.');
+    console.warn('ADMINS не настроены. Уведомления не отправляются.');
     ctx.reply('ℹ️ *Информация:* Админские уведомления не настроены. Ваше сообщение сохранено.');
   }
 });
 
-// ==================== ИНЛАЙН КНОПКИ ДЛЯ АДМИНА ====================
+// ==================== ИНЛАЙН КНОПКИ ДЛЯ АДМИНОВ ====================
 
 // Обработка callback-кнопок
 bot.action(/reply_(.+)_(.+)/, async (ctx) => {
@@ -334,12 +354,19 @@ bot.action(/reply_(.+)_(.+)/, async (ctx) => {
     return;
   }
   
+  // Проверяем, является ли пользователь админом
+  if (!isAdmin(ctx.from.id)) {
+    ctx.answerCbQuery('Только админы могут отвечать');
+    return;
+  }
+  
   // Сохраняем состояние для ответа
   ctx.session = ctx.session || {};
   ctx.session.replyTo = {
     userId: parseInt(userId),
     messageId: parseInt(messageId),
-    username: userData.username
+    username: userData.username,
+    adminId: ctx.from.id
   };
   
   ctx.answerCbQuery();
@@ -362,6 +389,12 @@ bot.action(/profile_(.+)/, async (ctx) => {
     return;
   }
   
+  // Проверяем, является ли пользователь админом
+  if (!isAdmin(ctx.from.id)) {
+    ctx.answerCbQuery('Только админы могут просматривать профили');
+    return;
+  }
+  
   const profileMessage = `👤 *ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ*\n\n` +
     `🔖 Username: @${userData.username}\n` +
     `👤 Имя: ${userData.firstName} ${userData.lastName}\n` +
@@ -376,14 +409,21 @@ bot.action(/profile_(.+)/, async (ctx) => {
   ctx.reply(profileMessage, { parse_mode: 'Markdown' });
 });
 
-// ==================== ОБРАБОТКА ОТВЕТОВ АДМИНА ====================
+// ==================== ОБРАБОТКА ОТВЕТОВ АДМИНОВ ====================
 
-// Обработка ответов админа (только если сообщение от админа)
+// Обработка ответов админов (только если сообщение от админа)
 bot.on('text', async (ctx) => {
   // Проверяем, что сообщение от админа и есть состояние для ответа
-  if (ctx.message.from.id === ADMIN_ID && ctx.session?.replyTo) {
+  if (isAdmin(ctx.message.from.id) && ctx.session?.replyTo) {
     const replyData = ctx.session.replyTo;
     const replyText = ctx.message.text;
+    
+    // Проверяем, что админ отвечает на свой же запрос
+    if (replyData.adminId !== ctx.message.from.id) {
+      ctx.reply('❌ *Ошибка:* Вы можете отвечать только на свои запросы.');
+      delete ctx.session.replyTo;
+      return;
+    }
     
     try {
       // Отправляем ответ пользователю
@@ -412,6 +452,61 @@ bot.on('text', async (ctx) => {
       );
     }
   }
+});
+
+// ==================== АДМИНСКИЕ КОМАНДЫ ====================
+
+// Команда /admin для админов
+bot.command('admin', (ctx) => {
+  if (!isAdmin(ctx.message.from.id)) {
+    ctx.reply('❌ *Доступ запрещен.* Эта команда только для админов.');
+    return;
+  }
+  
+  const adminMessage = `👑 *ПАНЕЛЬ АДМИНИСТРАТОРА*\n\n` +
+    `*Статистика:*\n` +
+    `👥 Всего пользователей: ${userMessages.size}\n` +
+    `📨 Всего сообщений: ${Array.from(userMessages.values()).reduce((sum, user) => sum + user.messages.length, 0)}\n\n` +
+    `*Команды:*\n` +
+    `/admin - Эта панель\n` +
+    `/users - Список пользователей\n` +
+    `/broadcast [сообщение] - Рассылка всем пользователям\n\n` +
+    `*Информация:*\n` +
+    `Ваш ID: ${ctx.message.from.id}\n` +
+    `Всего админов: ${ADMINS.length}`;
+  
+  ctx.reply(adminMessage, { parse_mode: 'Markdown' });
+});
+
+// Команда /users для админов
+bot.command('users', (ctx) => {
+  if (!isAdmin(ctx.message.from.id)) {
+    ctx.reply('❌ *Доступ запрещен.* Эта команда только для админов.');
+    return;
+  }
+  
+  if (userMessages.size === 0) {
+    ctx.reply('📭 *Пользователей пока нет.*');
+    return;
+  }
+  
+  let usersList = `👥 *СПИСОК ПОЛЬЗОВАТЕЛЕЙ (${userMessages.size}):*\n\n`;
+  
+  Array.from(userMessages.entries()).slice(0, 20).forEach(([userId, userData], index) => {
+    usersList += `${index + 1}. @${userData.username} (ID: ${userId})\n`;
+    usersList += `   Сообщений: ${userData.messages.length}\n`;
+    if (userData.messages.length > 0) {
+      const lastMsg = userData.messages[userData.messages.length - 1];
+      usersList += `   Последнее: "${lastMsg.text.substring(0, 30)}${lastMsg.text.length > 30 ? '...' : ''}"\n`;
+    }
+    usersList += '\n';
+  });
+  
+  if (userMessages.size > 20) {
+    usersList += `... и еще ${userMessages.size - 20} пользователей`;
+  }
+  
+  ctx.reply(usersList, { parse_mode: 'Markdown' });
 });
 
 // ==================== ОБРАБОТЧИК ДЛЯ YANDEX CLOUD FUNCTIONS ====================
@@ -449,17 +544,22 @@ module.exports.handler = async function (event, context) {
 
 console.log('🤖 Telegram Agent Bot запущен!');
 console.log('📝 Функции:');
-console.log('  • Уведомления админа о новых сообщениях');
+console.log('  • Уведомления админов о новых сообщениях');
 console.log('  • Погода через Яндекс API');
 console.log('  • Перенаправление сообщений');
-console.log('  • Ответы админа пользователям');
+console.log('  • Ответы админов пользователям');
+console.log('  • Админская панель (/admin)');
 
-if (!ADMIN_ID) {
-  console.warn('⚠️  ADMIN_ID не настроен. Уведомления админа не будут работать.');
-  console.log('   Для настройки добавьте переменную окружения ADMIN_ID с вашим Telegram ID');
+if (ADMINS.length === 0) {
+  console.warn('⚠️  ADMINS не настроены. Уведомления админов не будут работать.');
+  console.log('   Для настройки добавьте переменную окружения ADMINS с Telegram ID админов (через запятую)');
+} else {
+  console.log(`✅ Настроено админов: ${ADMINS.length}`);
 }
 
 if (!YANDEX_WEATHER_API_KEY) {
   console.warn('⚠️  YANDEX_WEATHER_API_KEY не настроен. Функция погоды будет ограничена.');
   console.log('   Для настройки добавьте переменную окружения YANDEX_WEATHER_API_KEY');
+} else {
+  console.log('✅ Яндекс Погода API настроен');
 }
