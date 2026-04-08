@@ -1,0 +1,50 @@
+# Личные данные и секреты
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+*.env
+
+# Ключи и токены
+*.key
+*.pem
+*.p12
+*.crt
+*.cert
+
+# Файлы IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Логи
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Зависимости
+node_modules/
+package-lock.json
+yarn.lock
+
+# Сборка
+dist/
+build/
+.out/
+.next/
+
+# Операционные системы
+.DS_Store
+Thumbs.db
+
+# Yandex Cloud
+*.yc
+.yc/
+.yc-config
+
+# SourceCraft
+.sourcecraft/ci.yaml.local

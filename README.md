@@ -1,202 +1,200 @@
-# 🤖 Telegram Agent Bot
+# 🚀 Yandex Cloud Function Project
 
-Персональный бот-агент с уведомлениями и погодой. Перенаправляет сообщения админу и предоставляет погоду через Яндекс API.
+Шаблон для развертывания приложений в Yandex Cloud Functions через SourceCraft.
 
-## ✨ Возможности
+## 📁 Структура проекта
 
-### Для пользователей:
-- 📨 **Отправка сообщений** админу через бота
-- ⛅ **Погода** в любом городе через Яндекс API
-- 🔔 **Уведомления** о получении сообщений
-- 📊 **Статус** отправленных сообщений
+```
+project/
+├── src/                    # Исходный код приложения
+│   ├── index.js           # Основной файл функции
+│   ├── package.json       # Зависимости Node.js
+│   └── .env.example       # Пример переменных окружения
+├── .sourcecraft/          # Конфигурация CI/CD
+│   └── ci.yaml           # Конфигурация workflow
+├── .gitignore            # Игнорируемые файлы
+└── README.md             # Эта документация
+```
 
-### Для админа:
-- 🔔 **Мгновенные уведомления** о новых сообщениях
-- 👤 **Информация о пользователях** (профиль, история сообщений)
-- ✍️ **Ответы пользователям** через инлайн-кнопки
-- 📋 **Управление диалогами** в одном месте
+## 🔧 Настройка переменных окружения
 
-## 🚀 Быстрый старт
+### 1. Создайте файл `.env` в папке `src/`:
 
-### 1. Настройка интеграции с Yandex Cloud
+```bash
+# Пример .env файла
+BOT_TOKEN=your_telegram_bot_token_here
+API_KEY=your_api_key_here
+DATABASE_URL=your_database_url_here
+ADMIN_ID=your_telegram_id_here
+```
 
-В настройках вашей организации SourceCraft создайте сервисное подключение (Settings → Service Connections). Для развертывания Telegram-бота подойдут настройки по умолчанию.
+### 2. Использование в коде:
 
-{% note info "SourceCraft грант на сервисы облака Yandex Cloud" %}
+```javascript
+// index.js
+require('dotenv').config();
 
-Если вы находитесь в персональной организации SourceCraft вам будет предложено активировать грант на сервисы облака.
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const API_KEY = process.env.API_KEY;
 
-Персональная организация создается автоматически при регистрации в SourceCraft и заканчивается на Personal Organization (SourceСraft), в описании указано Created By SourceCraft.
+if (!BOT_TOKEN) {
+  console.error('❌ ОШИБКА: BOT_TOKEN не установлен!');
+  process.exit(1);
+}
+```
 
-{% endnote %}
+## 🚀 Развертывание в Yandex Cloud
 
-### 2. Регистрация Telegram-бота
+### Через SourceCraft CI/CD:
 
-#### 2.1 Создание бота
-1. Откройте [@BotFather](https://t.me/BotFather) в Telegram
-2. Отправьте команду `/newbot`
-3. Задайте имя (например, "Мой Agent Bot")
-4. Задайте username (должен заканчиваться на `...Bot` или `..._bot`)
-5. Сохраните полученный **BOT_TOKEN**
+1. **Настройте сервисное подключение** в SourceCraft
+2. **Запустите workflow** `deploy-function-workflow`
+3. **Укажите переменные окружения** в форме запуска
 
-#### 2.2 Получение ADMIN_ID
-1. Откройте [@userinfobot](https://t.me/userinfobot) в Telegram
-2. Отправьте любое сообщение
-3. Сохраните значение **Id** (это ваш ADMIN_ID)
+### Переменные окружения в Yandex Cloud:
 
-#### 2.3 (Опционально) Получение Яндекс Погоды API
-1. Зарегистрируйтесь на [developer.tech.yandex.ru](https://developer.tech.yandex.ru/)
-2. Создайте новый ключ для API Яндекс.Погоды
-3. Сохраните полученный **YANDEX_WEATHER_API_KEY**
+В Yandex Cloud Functions переменные окружения настраиваются:
+- Через интерфейс Yandex Cloud Console
+- Через параметр `ENVIRONMENT` в CI/CD конфигурации
+- Через yc CLI: `yc serverless function set-environment`
 
-### 3. Запуск процесса сборки и развертывания
+## 📦 CI/CD Конфигурация
 
-1. Перейдите в секцию **CI/CD** для вашего репозитория
-2. Нажмите кнопку **New Launch**
-3. Заполните параметры:
-   - **bot-username**: Имя вашего бота (без `_bot` или `Bot`)
-   - **bot-token**: Токен бота из @BotFather
-4. Нажмите **Run**
-
-### 4. Настройка переменных окружения (опционально)
-
-Для расширенной функциональности добавьте переменные окружения в CI/CD:
+Пример `.sourcecraft/ci.yaml`:
 
 ```yaml
-ENVIRONMENT: "BOT_TOKEN=ваш_токен ADMINS=ваш_admin_id YANDEX_WEATHER_API_KEY=ваш_ключ_погоды"
+workflows:
+  deploy-function-workflow:
+    inputs:
+      function-name:
+        type: string
+        required: true
+      environment-vars:
+        type: string
+        default: ""
+        description: "Переменные окружения в формате KEY1=value1,KEY2=value2"
+    
+    env:
+      YC_FUNCTION_NAME: ${{ inputs.function-name }}
+      ENVIRONMENT: ${{ inputs.environment-vars }}
+    
+    tasks:
+      - name: deploy
+        cubes:
+          - name: deploy-function
+            env:
+              YC_FUNCTION_RUNTIME: nodejs22
+              YC_FUNCTION_ENTRYPOINT: index.handler
+              SOURCE_PATH: "./src"
+              PUBLIC: true
+            image: cr.yandex/sourcecraft/yc-function:latest
 ```
 
-Или настройте их в интерфейсе Yandex Cloud Functions после деплоя.
+## 🔒 Безопасность
 
-## 📋 Команды бота
+### Что НЕ коммитить в Git:
+- ✅ `.env` файлы
+- ✅ Ключи API
+- ✅ Токены доступа
+- ✅ Пароли
+- ✅ Приватные ключи
 
-### Для всех пользователей:
-- `/start` - Начало работы с ботом
-- `/help` - Помощь и список команд
-- `/weather [город]` - Погода в указанном городе (по умолчанию Москва)
-- `/status` - Статус ваших сообщений
+### Что коммитить:
+- ✅ `.env.example` (без реальных значений)
+- ✅ Код приложения
+- ✅ Конфигурационные файлы
+- ✅ Документацию
 
-### Для админа:
-- Автоматические уведомления о новых сообщениях
-- Инлайн-кнопки для ответа пользователям
-- Просмотр профилей пользователей
+## 💻 Локальная разработка
 
-## 🔧 Технические детали
+### 1. Клонируйте репозиторий:
 
-### Переменные окружения
-
-| Переменная | Обязательная | Описание |
-|------------|--------------|----------|
-| `BOT_TOKEN` | ✅ | Токен Telegram бота от @BotFather |
-| `ADMIN_ID` | ❌ | ID админа в Telegram (для уведомлений) |
-| `YANDEX_WEATHER_API_KEY` | ❌ | Ключ API Яндекс Погоды |
-
-### Структура проекта
-
-```
-src/
-├── index.js          # Основной код бота
-├── package.json      # Зависимости Node.js
-└── .env.example      # Пример переменных окружения
+```bash
+git clone https://sourcecraft.dev/ilyanull4/agent-bot
+cd agent-bot
 ```
 
-### Зависимости
+### 2. Установите зависимости:
 
-- `telegraf` ^4.12.0 - Фреймворк для Telegram ботов
-- `axios` ^1.6.0 - HTTP клиент для API запросов
-- `dotenv` ^16.3.0 - Загрузка переменных окружения
+```bash
+cd src
+npm install
+```
 
-## 🛠️ Разработка
+### 3. Настройте окружение:
 
-### Локальная разработка
+```bash
+cp .env.example .env
+# Отредактируйте .env файл
+```
 
-1. Клонируйте репозиторий:
-   ```bash
-   git clone https://sourcecraft.dev/ilyanull4/agent-bot
-   cd agent-bot/src
-   ```
+### 4. Запустите локально:
 
-2. Установите зависимости:
-   ```bash
-   npm install
-   ```
+```bash
+node index.js
+```
 
-3. Создайте файл `.env` на основе `.env.example`:
-   ```bash
-   cp .env.example .env
-   ```
+## 🌐 Деплой через Git
 
-4. Заполните `.env` файл:
-   ```env
-   BOT_TOKEN=ваш_токен
-   ADMIN_ID=ваш_id
-   YANDEX_WEATHER_API_KEY=ваш_ключ_погоды
-   ```
+### 1. Инициализируйте Git:
 
-5. Запустите бота локально:
-   ```bash
-   node index.js
-   ```
+```bash
+git init
+git add .
+git commit -m "Initial commit"
+```
 
-### Тестирование вебхука
+### 2. Добавьте удаленный репозиторий:
 
-Для локального тестирования используйте [ngrok](https://ngrok.com/):
+```bash
+git remote add origin https://sourcecraft.dev/ilyanull4/agent-bot
+```
 
-1. Установите ngrok
-2. Запустите бота локально
-3. В другом терминале:
-   ```bash
-   ngrok http 3000
-   ```
-4. Установите вебхук:
-   ```bash
-   curl -F "url=https://ваш-домен.ngrok.io" https://api.telegram.org/botВАШ_ТОКЕН/setWebhook
-   ```
+### 3. Закоммитьте изменения:
 
-## 🚨 Устранение неполадок
+```bash
+git add .
+git commit -m "Your commit message"
+git push origin main
+```
 
-### 1. Бот не отвечает
-- Проверьте, что токен бота верный
-- Убедитесь, что функция развернута и публичная
-- Проверьте логи в Yandex Cloud Functions
+### 4. Запустите деплой в SourceCraft:
 
-### 2. Уведомления не приходят админу
-- Проверьте, что `ADMIN_ID` установлен правильно
-- Убедитесь, что админ не заблокировал бота
+- Перейдите в CI/CD репозитория
+- Запустите workflow с нужными параметрами
 
-### 3. Погода не работает
-- Проверьте, что `YANDEX_WEATHER_API_KEY` установлен
-- Убедитесь, что ключ активен и имеет доступ к API Погоды
-- Проверьте правильность названия города
+## 🛠️ Полезные команды
 
-### 4. Ошибка "Permission Denied"
-- Убедитесь, что сервисный аккаунт имеет роль `functions.admin`
-- Проверьте настройки сервисного подключения в SourceCraft
+### Проверка функции:
 
-## 🔄 Обновление бота
+```bash
+# Проверить статус функции
+curl https://functions.yandexcloud.net/your-function-id
 
-При каждом коммите в ветку `main` автоматически запускается процесс деплоя. Для ручного обновления:
+# Тестирование с данными
+curl -X POST https://functions.yandexcloud.net/your-function-id \
+  -H "Content-Type: application/json" \
+  -d '{"test": "data"}'
+```
 
-1. Внесите изменения в код
-2. Закоммитьте изменения:
-   ```bash
-   git add .
-   git commit -m "Описание изменений"
-   git push origin main
-   ```
-3. Или запустите workflow вручную через интерфейс SourceCraft CI/CD
+### Управление через yc CLI:
+
+```bash
+# Установить переменные окружения
+yc serverless function set-environment \
+  --id your-function-id \
+  --environment "KEY1=value1,KEY2=value2"
+
+# Получить логи
+yc serverless function logs --id your-function-id
+```
 
 ## 📞 Поддержка
 
-Если у вас возникли проблемы:
-1. Проверьте логи в Yandex Cloud Functions
-2. Ознакомьтесь с FAQ ниже
-3. Создайте issue в репозитории
+- [Документация Yandex Cloud Functions](https://cloud.yandex.ru/docs/functions/)
+- [Документация SourceCraft](https://sourcecraft.dev/portal/docs)
+- [Node.js документация](https://nodejs.org/docs/)
 
 ## 📄 Лицензия
 
 MIT License
-
----
-
-**Разработано с ❤️ для SourceCraft и Yandex Cloud**

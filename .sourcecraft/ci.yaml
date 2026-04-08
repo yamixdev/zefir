@@ -1,10 +1,10 @@
 on:
-  #push:
-  #  - workflows: deploy-tg-bot-workflow
-  #    filter: 
-  #      branches: ["master", "main"]
+  push:
+    - workflows: deploy-function-workflow
+      filter:
+        branches: ["main", "master"]
   pull_request:
-    - workflows: deploy-tg-bot-workflow
+    - workflows: deploy-function-workflow
       filter:
         source_branches: ["**", "!test**"]
         target_branches: "main"
@@ -15,66 +15,83 @@ tokens:
     scope: org
 
 workflows:
-  deploy-tg-bot-workflow:
+  deploy-function-workflow:
     inputs:
-      bot-username:
-        type: string #- name: Field does not match the pattern /|[a-z][-a-z0-9]{1,61}[a-z0-9]/
-        required: true
-        description: Your Telegram bot username without _bot from BotFather. Name must match the pattern /|[a-z][-a-z0-9]{1,61}[a-z0-9]/
-      bot-token:
+      function-name:
         type: string
-        default: "YOUR_TG_BOT_TOKEN"
-        description: Your Telegram bot token from BotFather
+        required: true
+        description: "Имя функции в Yandex Cloud (только латинские буквы, цифры и дефисы)"
+      environment-vars:
+        type: string
+        default: ""
+        description: "Переменные окружения в формате KEY1=value1,KEY2=value2"
+      make-public:
+        type: boolean
+        default: true
+        description: "Сделать функцию публичной (требуются права functions.admin)"
     env:
-      YC_BOT_NAME: ${{ inputs.bot-username }}
-      TG_BOT_TOKEN: ${{ inputs.bot-token }}
+      YC_FUNCTION_NAME: ${{ inputs.function-name }}
     tasks:
-      - name: deploy-tg-backend-task
-        cubes: 
-          - name: format-name
+      - name: deploy-function-task
+        cubes:
+          - name: validate-function-name
             script:
               - |
-                func_name=$(echo "$YC_BOT_NAME" | tr '[:upper:]' '[:lower:]' | tr -d '_')
-                echo "function_name=$func_name" >> $SOURCECRAFT_OUTPUT
+                # Проверяем имя функции
+                if ! echo "$YC_FUNCTION_NAME" | grep -qE '^[a-z][-a-z0-9]{0,61}[a-z0-9]$'; then
+                  echo "❌ Ошибка: Имя функции должно соответствовать паттерну: /^[a-z][-a-z0-9]{0,61}[a-z0-9]$/"
+                  echo "   Пример: my-function, test-api, hello-world"
+                  exit 1
+                fi
+                echo "✅ Имя функции валидно: $YC_FUNCTION_NAME"
                 
-          - name: deploy-func
+          - name: deploy-function
             env:
               ID_TOKEN: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.id_token }}
-              YC_SA_ID: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.service_account_id }}  
-              YC_FOLDER_ID: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.folder_id }} 
-              YC_FUNCTION_NAME: ${{ cubes.format-name.outputs.function_name }}
+              YC_SA_ID: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.service_account_id }}
+              YC_FOLDER_ID: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.folder_id }}
               YC_FUNCTION_RUNTIME: nodejs22
               YC_FUNCTION_ENTRYPOINT: index.handler
               SOURCE_PATH: "./src"
-              ENVIRONMENT: "BOT_TOKEN=${{ inputs.bot-token }}"
-              PUBLIC: true
+              ENVIRONMENT: ${{ inputs.environment-vars }}
+              PUBLIC: ${{ inputs.make-public }}
             image: cr.yandex/sourcecraft/yc-function:latest
-
-          - name: register-with-botfather
+            
+          - name: get-function-info
             env:
-              TG_BOT_TOKEN: ${{ inputs.bot-token }}
+              ID_TOKEN: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.id_token }}
+              YC_FOLDER_ID: ${{ tokens.SERVICE_CONNECTION_WITH_TOKEN.folder_id }}
             script:
               - |
-                # Check if TG_BOT_TOKEN is set and not equal to placeholder
-                if [ -n "$TG_BOT_TOKEN" ] && [ "$TG_BOT_TOKEN" != "YOUR_TG_BOT_TOKEN" ]; then
-                    echo "TG_BOT_TOKEN is properly set"
-                    echo "Setting webhook..."
-                    curl --request POST --url https://api.telegram.org/bot$TG_BOT_TOKEN/setWebhook?url=${{cubes.deploy-func.outputs.invoke_url}}
-                    echo "Webhook set!"
+                # Получаем информацию о функции
+                echo "🔧 Информация о развернутой функции:"
+                echo "📝 Имя функции: $YC_FUNCTION_NAME"
+                echo "🔗 Invoke URL: ${{ cubes.deploy-function.outputs.invoke_url }}"
+                echo "📍 Deployment Location: ${{ cubes.deploy-function.outputs.deployment_location }}"
+                echo ""
+                echo "📋 Переменные окружения:"
+                if [ -n "${{ inputs.environment-vars }}" ]; then
+                  echo "${{ inputs.environment-vars }}" | tr ',' '\n' | while read -r var; do
+                    if [ -n "$var" ]; then
+                      key=$(echo "$var" | cut -d'=' -f1)
+                      echo "   • $key: [установлено]"
+                    fi
+                  done
                 else
-                    echo "TG_BOT_TOKEN is either not set or equals placeholder value"
+                  echo "   • Не установлены"
                 fi
-
-          - name: get-outputs
+                echo ""
+                echo "🚀 Функция успешно развернута!"
+                echo "📚 Документация: https://cloud.yandex.ru/docs/functions/"
+                
+          - name: save-outputs
             script:
               - |
-                echo "invoke_url=${{ cubes.deploy-func.outputs.invoke_url }}"
-                echo "deployment_location=${{ cubes.deploy-func.outputs.deployment_location }}"
-                echo "invoke_url=${{ cubes.deploy-func.outputs.invoke_url }}" > invoke_url.txt
-                echo "deployment_location=${{ cubes.deploy-func.outputs.deployment_location }}" > deployment_location.txt
+                echo "invoke_url=${{ cubes.deploy-function.outputs.invoke_url }}" > invoke_url.txt
+                echo "deployment_location=${{ cubes.deploy-function.outputs.deployment_location }}" > deployment_location.txt
+                echo "function_name=$YC_FUNCTION_NAME" > function_name.txt
             artifacts:
               paths:
                 - invoke_url.txt
                 - deployment_location.txt
-
-            
+                - function_name.txt

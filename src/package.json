@@ -1,16 +1,26 @@
 {
-  "name": "telegram-agent-bot",
+  "name": "yandex-cloud-function",
   "version": "1.0.0",
-  "description": "Телеграмм-бот агент с уведомлениями и погодой. Перенаправляет сообщения админу и предоставляет погоду через Яндекс API",
+  "description": "Шаблон Yandex Cloud Function с поддержкой переменных окружения",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
+    "dev": "node -r dotenv/config index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [
+    "yandex-cloud",
+    "serverless",
+    "function",
+    "nodejs"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "telegraf": "^4.12.0",
-    "axios": "^1.6.0",
     "dotenv": "^16.3.0"
+  },
+  "devDependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
