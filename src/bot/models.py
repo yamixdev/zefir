@@ -1,3 +1,6 @@
+"""Все запросы к БД идут через пул из db.py — pool автоматически
+обрабатывает мёртвые соединения (Neon suspend после 5 мин бездействия).
+"""
 from datetime import datetime, timedelta, timezone
 
 from bot.config import config
@@ -8,22 +11,25 @@ from bot.db import get_pool
 
 async def upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None):
     pool = await get_pool()
-    await pool.execute(
-        """
-        INSERT INTO users (user_id, username, first_name, last_name)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (user_id) DO UPDATE
-            SET username   = COALESCE($2, users.username),
-                first_name = COALESCE($3, users.first_name),
-                last_name  = COALESCE($4, users.last_name)
-        """,
-        user_id, username, first_name, last_name,
-    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, username, first_name, last_name)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE
+                SET username   = COALESCE(%s, users.username),
+                    first_name = COALESCE(%s, users.first_name),
+                    last_name  = COALESCE(%s, users.last_name)
+            """,
+            (user_id, username, first_name, last_name, username, first_name, last_name),
+        )
 
 
 async def get_user(user_id: int):
     pool = await get_pool()
-    return await pool.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+        return await cur.fetchone()
 
 
 async def is_banned(user_id: int) -> bool:
@@ -33,171 +39,348 @@ async def is_banned(user_id: int) -> bool:
 
 async def set_ban(user_id: int, banned: bool):
     pool = await get_pool()
-    await pool.execute("UPDATE users SET is_banned = $2 WHERE user_id = $1", user_id, banned)
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE users SET is_banned = %s WHERE user_id = %s", (banned, user_id))
 
 
 async def get_all_users():
     pool = await get_pool()
-    return await pool.fetch("SELECT * FROM users ORDER BY created_at DESC")
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM users ORDER BY created_at DESC")
+        return await cur.fetchall()
 
 
 async def get_users_count() -> int:
     pool = await get_pool()
-    return await pool.fetchval("SELECT COUNT(*) FROM users")
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT COUNT(*) AS cnt FROM users")
+        row = await cur.fetchone()
+        return row["cnt"]
+
+
+async def get_new_users_count(hours: int = 24) -> int:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS cnt FROM users WHERE created_at >= NOW() - make_interval(hours => %s)",
+            (hours,),
+        )
+        row = await cur.fetchone()
+        return row["cnt"]
+
+
+async def get_banned_count() -> int:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT COUNT(*) AS cnt FROM users WHERE is_banned = TRUE")
+        row = await cur.fetchone()
+        return row["cnt"]
+
+
+async def get_last_menu_msg_id(user_id: int) -> int | None:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT last_menu_msg_id FROM users WHERE user_id = %s", (user_id,)
+        )
+        row = await cur.fetchone()
+        return row["last_menu_msg_id"] if row else None
+
+
+async def set_last_menu_msg_id(user_id: int, msg_id: int | None):
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE users SET last_menu_msg_id = %s WHERE user_id = %s",
+            (msg_id, user_id),
+        )
+
+
+async def get_top_ai_users(limit: int = 5):
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT user_id, username, first_name, ai_messages_used
+            FROM users
+            WHERE ai_messages_used > 0
+            ORDER BY ai_messages_used DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return await cur.fetchall()
 
 
 # ── AI Limits ────────────────────────────────────────────────────
 
 async def check_ai_limit(user_id: int) -> tuple[bool, int]:
-    """Returns (allowed, remaining). Resets counter if period expired."""
+    """Returns (allowed, remaining). Resets counter if period expired. Includes ai_bonus."""
     pool = await get_pool()
     now = datetime.now(timezone.utc)
 
-    user = await pool.fetchrow(
-        "SELECT ai_messages_used, ai_limit_reset_at FROM users WHERE user_id = $1", user_id
-    )
-    if not user:
-        return False, 0
-
-    # Reset if period expired
-    if user["ai_limit_reset_at"] is None or now >= user["ai_limit_reset_at"]:
-        new_reset = now + timedelta(hours=config.ai_limit_hours)
-        await pool.execute(
-            "UPDATE users SET ai_messages_used = 0, ai_limit_reset_at = $2 WHERE user_id = $1",
-            user_id, new_reset,
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT ai_messages_used, ai_bonus, ai_limit_reset_at FROM users WHERE user_id = %s",
+            (user_id,),
         )
-        return True, config.ai_daily_limit
+        user = await cur.fetchone()
+        if not user:
+            return False, 0
 
+        bonus = user["ai_bonus"] or 0
+
+        if user["ai_limit_reset_at"] is None or now >= user["ai_limit_reset_at"]:
+            new_reset = now + timedelta(hours=config.ai_limit_hours)
+            await conn.execute(
+                "UPDATE users SET ai_messages_used = 0, ai_limit_reset_at = %s WHERE user_id = %s",
+                (new_reset, user_id),
+            )
+            return True, config.ai_daily_limit + bonus
+
+        used = user["ai_messages_used"]
+        remaining = config.ai_daily_limit + bonus - used
+        return remaining > 0, max(remaining, 0)
+
+
+async def get_ai_limit_info(user_id: int) -> dict:
+    """Returns {used, bonus, remaining, reset_at} without mutation."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT ai_messages_used, ai_bonus, ai_limit_reset_at FROM users WHERE user_id = %s",
+            (user_id,),
+        )
+        user = await cur.fetchone()
+    if not user:
+        return {"used": 0, "bonus": 0, "remaining": config.ai_daily_limit, "reset_at": None}
     used = user["ai_messages_used"]
-    remaining = config.ai_daily_limit - used
-    return remaining > 0, max(remaining, 0)
+    bonus = user["ai_bonus"] or 0
+    return {
+        "used": used,
+        "bonus": bonus,
+        "remaining": max(config.ai_daily_limit + bonus - used, 0),
+        "reset_at": user["ai_limit_reset_at"],
+    }
 
 
 async def increment_ai_usage(user_id: int):
     pool = await get_pool()
-    await pool.execute(
-        "UPDATE users SET ai_messages_used = ai_messages_used + 1 WHERE user_id = $1", user_id
-    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE users SET ai_messages_used = ai_messages_used + 1 WHERE user_id = %s", (user_id,)
+        )
 
 
 async def reset_ai_limits_all():
     pool = await get_pool()
     now = datetime.now(timezone.utc)
     new_reset = now + timedelta(hours=config.ai_limit_hours)
-    await pool.execute(
-        "UPDATE users SET ai_messages_used = 0, ai_limit_reset_at = $1", new_reset
-    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE users SET ai_messages_used = 0, ai_limit_reset_at = %s", (new_reset,)
+        )
 
 
 async def reset_ai_limit_user(user_id: int):
     pool = await get_pool()
     now = datetime.now(timezone.utc)
     new_reset = now + timedelta(hours=config.ai_limit_hours)
-    await pool.execute(
-        "UPDATE users SET ai_messages_used = 0, ai_limit_reset_at = $2 WHERE user_id = $1",
-        user_id, new_reset,
-    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE users SET ai_messages_used = 0, ai_limit_reset_at = %s WHERE user_id = %s",
+            (new_reset, user_id),
+        )
+
+
+async def has_accepted_consent(user_id: int, version: str) -> bool:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT 1 FROM user_consents WHERE user_id = %s AND doc_version = %s LIMIT 1",
+            (user_id, version),
+        )
+        return (await cur.fetchone()) is not None
+
+
+async def accept_consent(user_id: int, version: str, doc_hash: str):
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_consents (user_id, doc_version, doc_hash)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, doc_version) DO NOTHING
+            """,
+            (user_id, version, doc_hash),
+        )
+
+
+async def grant_ai_bonus(user_id: int, amount: int) -> int:
+    """Adds `amount` to user's ai_bonus. Returns new bonus value."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "UPDATE users SET ai_bonus = COALESCE(ai_bonus, 0) + %s WHERE user_id = %s RETURNING ai_bonus",
+            (amount, user_id),
+        )
+        row = await cur.fetchone()
+    return row["ai_bonus"] if row else amount
 
 
 # ── Tickets ──────────────────────────────────────────────────────
 
 async def create_ticket(user_id: int, message: str, ai_summary: str | None = None) -> int:
     pool = await get_pool()
-    return await pool.fetchval(
-        """
-        INSERT INTO tickets (user_id, message, ai_summary)
-        VALUES ($1, $2, $3)
-        RETURNING id
-        """,
-        user_id, message, ai_summary,
-    )
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            INSERT INTO tickets (user_id, message, ai_summary)
+            VALUES (%s, %s, %s)
+            RETURNING id
+            """,
+            (user_id, message, ai_summary),
+        )
+        row = await cur.fetchone()
+    return row["id"]
 
 
 async def get_ticket(ticket_id: int):
     pool = await get_pool()
-    return await pool.fetchrow("SELECT * FROM tickets WHERE id = $1", ticket_id)
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT * FROM tickets WHERE id = %s", (ticket_id,))
+        return await cur.fetchone()
+
+
+async def mark_ticket_seen(ticket_id: int):
+    """Set seen_at if not yet set (admin opened the ticket)."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE tickets SET seen_at = NOW() WHERE id = %s AND seen_at IS NULL",
+            (ticket_id,),
+        )
 
 
 async def get_user_tickets(user_id: int, limit: int = 10):
     pool = await get_pool()
-    return await pool.fetch(
-        "SELECT * FROM tickets WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
-        user_id, limit,
-    )
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "SELECT * FROM tickets WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
+            (user_id, limit),
+        )
+        return await cur.fetchall()
+
+
+async def get_user_ticket_stats(user_id: int) -> dict:
+    """Returns counts by derived status: sent, seen, replied, total."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE status != 'closed' AND seen_at IS NULL) AS sent,
+                COUNT(*) FILTER (WHERE status != 'closed' AND seen_at IS NOT NULL) AS seen,
+                COUNT(*) FILTER (WHERE status = 'closed' AND admin_reply IS NOT NULL) AS replied,
+                COUNT(*) AS total
+            FROM tickets
+            WHERE user_id = %s
+            """,
+            (user_id,),
+        )
+        return await cur.fetchone()
 
 
 async def get_open_tickets(limit: int = 20, offset: int = 0):
     pool = await get_pool()
-    return await pool.fetch(
-        """
-        SELECT t.*, u.username, u.first_name
-        FROM tickets t JOIN users u ON t.user_id = u.user_id
-        WHERE t.status IN ('open', 'in_progress')
-        ORDER BY t.created_at DESC
-        LIMIT $1 OFFSET $2
-        """,
-        limit, offset,
-    )
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT t.*, u.username, u.first_name
+            FROM tickets t JOIN users u ON t.user_id = u.user_id
+            WHERE t.status IN ('open', 'in_progress')
+            ORDER BY t.created_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
+        )
+        return await cur.fetchall()
 
 
 async def count_open_tickets() -> int:
     pool = await get_pool()
-    return await pool.fetchval("SELECT COUNT(*) FROM tickets WHERE status IN ('open', 'in_progress')")
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT COUNT(*) AS cnt FROM tickets WHERE status IN ('open', 'in_progress')")
+        row = await cur.fetchone()
+        return row["cnt"]
 
 
 async def update_ticket_status(ticket_id: int, status: str):
     pool = await get_pool()
-    await pool.execute(
-        "UPDATE tickets SET status = $2, updated_at = NOW() WHERE id = $1",
-        ticket_id, status,
-    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE tickets SET status = %s, updated_at = NOW() WHERE id = %s",
+            (status, ticket_id),
+        )
 
 
 async def set_ticket_reply(ticket_id: int, reply: str):
     pool = await get_pool()
-    await pool.execute(
-        "UPDATE tickets SET admin_reply = $2, status = 'closed', updated_at = NOW() WHERE id = $1",
-        ticket_id, reply,
-    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE tickets SET admin_reply = %s, status = 'closed', updated_at = NOW() WHERE id = %s",
+            (reply, ticket_id),
+        )
 
 
 # ── AI Conversations ────────────────────────────────────────────
 
 async def save_ai_message(user_id: int, role: str, content: str):
     pool = await get_pool()
-    await pool.execute(
-        "INSERT INTO ai_conversations (user_id, role, content) VALUES ($1, $2, $3)",
-        user_id, role, content,
-    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO ai_conversations (user_id, role, content) VALUES (%s, %s, %s)",
+            (user_id, role, content),
+        )
 
 
-async def get_ai_history(user_id: int, limit: int = 10):
+async def get_ai_history(user_id: int, limit: int | None = None):
+    if limit is None:
+        limit = config.ai_history_limit
     pool = await get_pool()
-    rows = await pool.fetch(
-        """
-        SELECT role, content FROM ai_conversations
-        WHERE user_id = $1
-        ORDER BY created_at DESC
-        LIMIT $2
-        """,
-        user_id, limit,
-    )
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT role, content FROM ai_conversations
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        )
+        rows = await cur.fetchall()
     return list(reversed(rows))
 
 
 async def clear_ai_history(user_id: int):
     pool = await get_pool()
-    await pool.execute("DELETE FROM ai_conversations WHERE user_id = $1", user_id)
+    async with pool.connection() as conn:
+        await conn.execute("DELETE FROM ai_conversations WHERE user_id = %s", (user_id,))
 
 
 # ── Stats ────────────────────────────────────────────────────────
 
 async def get_stats() -> dict:
     pool = await get_pool()
-    users = await pool.fetchval("SELECT COUNT(*) FROM users")
-    tickets_total = await pool.fetchval("SELECT COUNT(*) FROM tickets")
-    tickets_open = await pool.fetchval("SELECT COUNT(*) FROM tickets WHERE status IN ('open', 'in_progress')")
-    ai_msgs = await pool.fetchval("SELECT COUNT(*) FROM ai_conversations")
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT COUNT(*) AS cnt FROM users")
+        users = (await cur.fetchone())["cnt"]
+        cur = await conn.execute("SELECT COUNT(*) AS cnt FROM tickets")
+        tickets_total = (await cur.fetchone())["cnt"]
+        cur = await conn.execute("SELECT COUNT(*) AS cnt FROM tickets WHERE status IN ('open', 'in_progress')")
+        tickets_open = (await cur.fetchone())["cnt"]
+        cur = await conn.execute("SELECT COUNT(*) AS cnt FROM ai_conversations")
+        ai_msgs = (await cur.fetchone())["cnt"]
     return {
         "users": users,
         "tickets_total": tickets_total,

@@ -14,8 +14,13 @@ from bot.handlers import setup_routers
 from bot.middlewares.user_register import UserRegisterMiddleware
 from bot.middlewares.rate_limit import RateLimitMiddleware
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("зефир")
 
 bot = Bot(
     token=config.bot_token,
@@ -32,13 +37,13 @@ dp.message.outer_middleware(RateLimitMiddleware())
 
 async def on_startup():
     await init_db()
-    logger.info("Bot started, DB connected")
+    logger.info("🤖 Бот запущен, БД подключена")
 
 
 async def on_shutdown():
     await close_db()
     await bot.session.close()
-    logger.info("Bot stopped")
+    logger.info("🔌 Бот остановлен, соединения закрыты")
 
 
 # ── Yandex Cloud Functions handler ──────────────────────────────
@@ -64,10 +69,19 @@ def handler(event, context):
 
 # ── Local polling for development ───────────────────────────────
 async def main():
-    dp.startup.register(lambda: on_startup())
-    dp.shutdown.register(lambda: on_shutdown())
-    await dp.start_polling(bot)
+    await on_startup()
+    # Remove webhook so polling works locally
+    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await on_shutdown()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    if sys.platform == "win32":
+        import selectors
+        asyncio.run(main(), loop_factory=asyncio.SelectorEventLoop)
+    else:
+        asyncio.run(main())

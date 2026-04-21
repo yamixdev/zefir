@@ -12,18 +12,12 @@ class Config:
     admins: list[int] = field(default_factory=list)
     database_url: str = os.getenv("DATABASE_URL", "")
 
-    # OpenWeatherMap
     openweathermap_api_key: str = os.getenv("OPENWEATHERMAP_API_KEY", "")
-
-    # Yandex GPT
     yandex_gpt_api_key: str = os.getenv("YANDEX_GPT_API_KEY", "")
-    yandex_gpt_base_url: str = os.getenv("YANDEX_GPT_BASE_URL", "https://ai.api.cloud.yandex.net/v1")
-    yandex_gpt_project: str = os.getenv("YANDEX_GPT_PROJECT", "")
-    yandex_gpt_prompt_id: str = os.getenv("YANDEX_GPT_PROMPT_ID", "")
 
-    # Rate limits
-    ai_daily_limit: int = int(os.getenv("AI_DAILY_LIMIT", "52"))
+    ai_daily_limit: int = int(os.getenv("AI_DAILY_LIMIT", "200"))
     ai_limit_hours: int = int(os.getenv("AI_LIMIT_HOURS", "12"))
+    ai_history_limit: int = 30
     message_cooldown_sec: int = 3
 
     def __post_init__(self):
