@@ -13,7 +13,7 @@ import aiohttp
 
 from bot.config import config
 
-logger = logging.getLogger("зефир.api")
+logger = logging.getLogger("зефирка.api")
 
 YANDEX_URL = "https://ai.api.cloud.yandex.net/v1/responses"
 YANDEX_OCR_URL = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"

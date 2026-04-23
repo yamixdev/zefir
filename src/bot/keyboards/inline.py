@@ -2,19 +2,31 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
-# ── Main menu ────────────────────────────────────────────────────
+# ── Main menu (2 двери) ─────────────────────────────────────────
 
 def main_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📨 Написать админу", callback_data="ticket:new"))
-    kb.row(
-        InlineKeyboardButton(text="🐱 Зефир", callback_data="ai:start"),
-        InlineKeyboardButton(text="⛅ Погода", callback_data="weather:ask"),
-    )
-    kb.row(
-        InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile:me"),
-        InlineKeyboardButton(text="📊 Мои тикеты", callback_data="ticket:my"),
-    )
+    kb.row(InlineKeyboardButton(text="📨 Связаться с владельцем", callback_data="menu:contact"))
+    kb.row(InlineKeyboardButton(text="🎮 Развлечения и утилиты", callback_data="menu:fun"))
+    return kb.as_markup()
+
+
+def contact_submenu() -> InlineKeyboardMarkup:
+    """Подменю «Связаться с владельцем»."""
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="✉️ Написать владельцу", callback_data="ticket:new"))
+    kb.row(InlineKeyboardButton(text="📊 Мои тикеты", callback_data="ticket:my"))
+    kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
+    return kb.as_markup()
+
+
+def fun_submenu() -> InlineKeyboardMarkup:
+    """Подменю «Развлечения и утилиты». Сюда будут добавляться новые фичи."""
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🐱 Зефир (AI)", callback_data="ai:start"))
+    kb.row(InlineKeyboardButton(text="⛅ Погода", callback_data="weather:ask"))
+    kb.row(InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile:me"))
+    kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
     return kb.as_markup()
 
 

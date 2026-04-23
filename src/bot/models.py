@@ -1,30 +1,49 @@
-"""Все запросы к БД идут через пул из db.py — pool автоматически
-обрабатывает мёртвые соединения (Neon suspend после 5 мин бездействия).
+"""Все запросы к БД идут через пул из db.py.
+
+Каждая функция обёрнута в `@with_db_retry` — на OperationalError/InterfaceError
+(в т.ч. AdminShutdown после Neon autosuspend) пул пересоздаётся и запрос
+повторяется один раз. Это покрывает race между `pool.check_connection`
+и реальным `conn.execute`.
 """
 from datetime import datetime, timedelta, timezone
 
 from bot.config import config
-from bot.db import get_pool
+from bot.db import get_pool, with_db_retry
 
 
 # ── Users ────────────────────────────────────────────────────────
 
+WELCOME_ZEFIRKI = 100
+
+
+@with_db_retry
 async def upsert_user(user_id: int, username: str | None, first_name: str | None, last_name: str | None):
+    """Создаёт/обновляет юзера. Новому начисляет welcome-бонус зефирок
+    (RETURNING xmax=0 = этот ряд только что вставлен).
+    """
     pool = await get_pool()
     async with pool.connection() as conn:
-        await conn.execute(
+        cur = await conn.execute(
             """
-            INSERT INTO users (user_id, username, first_name, last_name)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO users (user_id, username, first_name, last_name, zefirki)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (user_id) DO UPDATE
                 SET username   = COALESCE(%s, users.username),
                     first_name = COALESCE(%s, users.first_name),
                     last_name  = COALESCE(%s, users.last_name)
+            RETURNING (xmax = 0) AS inserted
             """,
-            (user_id, username, first_name, last_name, username, first_name, last_name),
+            (user_id, username, first_name, last_name, WELCOME_ZEFIRKI, username, first_name, last_name),
         )
+        row = await cur.fetchone()
+        if row and row["inserted"]:
+            await conn.execute(
+                "INSERT INTO transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+                (user_id, WELCOME_ZEFIRKI, "welcome"),
+            )
 
 
+@with_db_retry
 async def get_user(user_id: int):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -32,17 +51,20 @@ async def get_user(user_id: int):
         return await cur.fetchone()
 
 
+@with_db_retry
 async def is_banned(user_id: int) -> bool:
     user = await get_user(user_id)
     return bool(user and user["is_banned"])
 
 
+@with_db_retry
 async def set_ban(user_id: int, banned: bool):
     pool = await get_pool()
     async with pool.connection() as conn:
         await conn.execute("UPDATE users SET is_banned = %s WHERE user_id = %s", (banned, user_id))
 
 
+@with_db_retry
 async def get_all_users():
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -50,6 +72,7 @@ async def get_all_users():
         return await cur.fetchall()
 
 
+@with_db_retry
 async def get_users_count() -> int:
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -58,6 +81,7 @@ async def get_users_count() -> int:
         return row["cnt"]
 
 
+@with_db_retry
 async def get_new_users_count(hours: int = 24) -> int:
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -69,6 +93,7 @@ async def get_new_users_count(hours: int = 24) -> int:
         return row["cnt"]
 
 
+@with_db_retry
 async def get_banned_count() -> int:
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -77,6 +102,7 @@ async def get_banned_count() -> int:
         return row["cnt"]
 
 
+@with_db_retry
 async def get_last_menu_msg_id(user_id: int) -> int | None:
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -87,6 +113,7 @@ async def get_last_menu_msg_id(user_id: int) -> int | None:
         return row["last_menu_msg_id"] if row else None
 
 
+@with_db_retry
 async def set_last_menu_msg_id(user_id: int, msg_id: int | None):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -96,6 +123,7 @@ async def set_last_menu_msg_id(user_id: int, msg_id: int | None):
         )
 
 
+@with_db_retry
 async def get_top_ai_users(limit: int = 5):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -112,8 +140,97 @@ async def get_top_ai_users(limit: int = 5):
         return await cur.fetchall()
 
 
+# ── Zefirki (внутренняя валюта) ─────────────────────────────────
+
+@with_db_retry
+async def get_zefirki_balance(user_id: int) -> int:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT zefirki FROM users WHERE user_id = %s", (user_id,))
+        row = await cur.fetchone()
+        return row["zefirki"] if row else 0
+
+
+@with_db_retry
+async def grant_zefirki(user_id: int, amount: int, reason: str) -> int:
+    """Начисляет зефирки, пишет транзакцию. Возвращает новый баланс.
+    Amount > 0 обязательно — для списания используй spend_zefirki.
+    """
+    if amount <= 0:
+        raise ValueError("grant_zefirki: amount must be positive")
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "UPDATE users SET zefirki = zefirki + %s WHERE user_id = %s RETURNING zefirki",
+            (amount, user_id),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return 0
+        await conn.execute(
+            "INSERT INTO transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+            (user_id, amount, reason),
+        )
+        return row["zefirki"]
+
+
+@with_db_retry
+async def spend_zefirki(user_id: int, amount: int, reason: str) -> tuple[bool, int]:
+    """Списывает зефирки. Returns (ok, new_balance).
+    ok=False если баланс меньше amount — списание не произойдёт.
+    Атомарно: проверка и списание в одном UPDATE.
+    """
+    if amount <= 0:
+        raise ValueError("spend_zefirki: amount must be positive")
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            UPDATE users
+               SET zefirki = zefirki - %s
+             WHERE user_id = %s AND zefirki >= %s
+            RETURNING zefirki
+            """,
+            (amount, user_id, amount),
+        )
+        row = await cur.fetchone()
+        if not row:
+            balance = await get_zefirki_balance_conn(conn, user_id)
+            return False, balance
+        await conn.execute(
+            "INSERT INTO transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+            (user_id, -amount, reason),
+        )
+        return True, row["zefirki"]
+
+
+async def get_zefirki_balance_conn(conn, user_id: int) -> int:
+    """Версия без декоратора — для переиспользования внутри других запросов."""
+    cur = await conn.execute("SELECT zefirki FROM users WHERE user_id = %s", (user_id,))
+    row = await cur.fetchone()
+    return row["zefirki"] if row else 0
+
+
+@with_db_retry
+async def get_recent_transactions(user_id: int, limit: int = 10):
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT amount, reason, created_at
+              FROM transactions
+             WHERE user_id = %s
+          ORDER BY created_at DESC
+             LIMIT %s
+            """,
+            (user_id, limit),
+        )
+        return await cur.fetchall()
+
+
 # ── AI Limits ────────────────────────────────────────────────────
 
+@with_db_retry
 async def check_ai_limit(user_id: int) -> tuple[bool, int]:
     """Returns (allowed, remaining). Resets counter if period expired. Includes ai_bonus."""
     pool = await get_pool()
@@ -143,6 +260,7 @@ async def check_ai_limit(user_id: int) -> tuple[bool, int]:
         return remaining > 0, max(remaining, 0)
 
 
+@with_db_retry
 async def get_ai_limit_info(user_id: int) -> dict:
     """Returns {used, bonus, remaining, reset_at} without mutation."""
     pool = await get_pool()
@@ -164,6 +282,7 @@ async def get_ai_limit_info(user_id: int) -> dict:
     }
 
 
+@with_db_retry
 async def increment_ai_usage(user_id: int):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -172,6 +291,7 @@ async def increment_ai_usage(user_id: int):
         )
 
 
+@with_db_retry
 async def reset_ai_limits_all():
     pool = await get_pool()
     now = datetime.now(timezone.utc)
@@ -182,6 +302,7 @@ async def reset_ai_limits_all():
         )
 
 
+@with_db_retry
 async def reset_ai_limit_user(user_id: int):
     pool = await get_pool()
     now = datetime.now(timezone.utc)
@@ -193,6 +314,7 @@ async def reset_ai_limit_user(user_id: int):
         )
 
 
+@with_db_retry
 async def has_accepted_consent(user_id: int, version: str) -> bool:
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -203,6 +325,7 @@ async def has_accepted_consent(user_id: int, version: str) -> bool:
         return (await cur.fetchone()) is not None
 
 
+@with_db_retry
 async def accept_consent(user_id: int, version: str, doc_hash: str):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -216,6 +339,7 @@ async def accept_consent(user_id: int, version: str, doc_hash: str):
         )
 
 
+@with_db_retry
 async def grant_ai_bonus(user_id: int, amount: int) -> int:
     """Adds `amount` to user's ai_bonus. Returns new bonus value."""
     pool = await get_pool()
@@ -230,6 +354,7 @@ async def grant_ai_bonus(user_id: int, amount: int) -> int:
 
 # ── Tickets ──────────────────────────────────────────────────────
 
+@with_db_retry
 async def create_ticket(user_id: int, message: str, ai_summary: str | None = None) -> int:
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -245,6 +370,7 @@ async def create_ticket(user_id: int, message: str, ai_summary: str | None = Non
     return row["id"]
 
 
+@with_db_retry
 async def get_ticket(ticket_id: int):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -252,6 +378,7 @@ async def get_ticket(ticket_id: int):
         return await cur.fetchone()
 
 
+@with_db_retry
 async def mark_ticket_seen(ticket_id: int):
     """Set seen_at if not yet set (admin opened the ticket)."""
     pool = await get_pool()
@@ -262,6 +389,7 @@ async def mark_ticket_seen(ticket_id: int):
         )
 
 
+@with_db_retry
 async def get_user_tickets(user_id: int, limit: int = 10):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -272,6 +400,7 @@ async def get_user_tickets(user_id: int, limit: int = 10):
         return await cur.fetchall()
 
 
+@with_db_retry
 async def get_user_ticket_stats(user_id: int) -> dict:
     """Returns counts by derived status: sent, seen, replied, total."""
     pool = await get_pool()
@@ -291,6 +420,7 @@ async def get_user_ticket_stats(user_id: int) -> dict:
         return await cur.fetchone()
 
 
+@with_db_retry
 async def get_open_tickets(limit: int = 20, offset: int = 0):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -307,6 +437,7 @@ async def get_open_tickets(limit: int = 20, offset: int = 0):
         return await cur.fetchall()
 
 
+@with_db_retry
 async def count_open_tickets() -> int:
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -315,6 +446,7 @@ async def count_open_tickets() -> int:
         return row["cnt"]
 
 
+@with_db_retry
 async def update_ticket_status(ticket_id: int, status: str):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -324,6 +456,7 @@ async def update_ticket_status(ticket_id: int, status: str):
         )
 
 
+@with_db_retry
 async def set_ticket_reply(ticket_id: int, reply: str):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -335,6 +468,7 @@ async def set_ticket_reply(ticket_id: int, reply: str):
 
 # ── AI Conversations ────────────────────────────────────────────
 
+@with_db_retry
 async def save_ai_message(user_id: int, role: str, content: str):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -344,6 +478,7 @@ async def save_ai_message(user_id: int, role: str, content: str):
         )
 
 
+@with_db_retry
 async def get_ai_history(user_id: int, limit: int | None = None):
     if limit is None:
         limit = config.ai_history_limit
@@ -362,6 +497,7 @@ async def get_ai_history(user_id: int, limit: int | None = None):
     return list(reversed(rows))
 
 
+@with_db_retry
 async def clear_ai_history(user_id: int):
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -370,6 +506,7 @@ async def clear_ai_history(user_id: int):
 
 # ── Stats ────────────────────────────────────────────────────────
 
+@with_db_retry
 async def get_stats() -> dict:
     pool = await get_pool()
     async with pool.connection() as conn:

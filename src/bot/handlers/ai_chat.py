@@ -19,7 +19,7 @@ from bot.models import (
 from bot.services.ai_service import chat_stream, chat_simple, ocr_image, AIError
 from bot.services.consent import TOS_VERSION, TOS_TEXT, PRIVACY_TEXT, docs_hash
 
-logger = logging.getLogger("зефир.чат")
+logger = logging.getLogger("зефирка.чат")
 router = Router()
 
 EDIT_INTERVAL = 1.5

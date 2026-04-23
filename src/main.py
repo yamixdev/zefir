@@ -11,6 +11,7 @@ from aiogram.types import Update
 from bot.config import config
 from bot.db import init_db, close_db
 from bot.handlers import setup_routers
+from bot.logging_ru import install_ru_localization
 from bot.middlewares.user_register import UserRegisterMiddleware
 from bot.middlewares.rate_limit import RateLimitMiddleware
 
@@ -20,7 +21,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("зефир")
+install_ru_localization()
+logger = logging.getLogger("зефирка")
 
 bot = Bot(
     token=config.bot_token,
@@ -37,13 +39,13 @@ dp.message.outer_middleware(RateLimitMiddleware())
 
 async def on_startup():
     await init_db()
-    logger.info("🤖 Бот запущен, БД подключена")
+    logger.info("🍬 Зефирка запущена, БД подключена")
 
 
 async def on_shutdown():
     await close_db()
     await bot.session.close()
-    logger.info("🔌 Бот остановлен, соединения закрыты")
+    logger.info("🔌 Зефирка остановлена, соединения закрыты")
 
 
 # ── Yandex Cloud Functions handler ──────────────────────────────

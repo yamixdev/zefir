@@ -2,40 +2,51 @@ from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 
-from bot.keyboards.inline import main_menu
-from bot.models import get_last_menu_msg_id, set_last_menu_msg_id
+from bot.keyboards.inline import main_menu, contact_submenu, fun_submenu
+from bot.models import get_last_menu_msg_id, set_last_menu_msg_id, get_zefirki_balance
 
 router = Router()
 
 WELCOME_TEXT = (
     "👋 <b>Привет, {name}!</b>\n\n"
-    "Я — бот-агент Зефира! 🐱\n\n"
-    "<b>Что я умею:</b>\n"
-    "📨 Принимать сообщения и передавать админу\n"
-    "🐱 Общаться с тобой как умный кот Зефир (AI)\n"
-    "⛅ Показывать погоду в любом городе\n"
-    "👤 Показывать твой профиль и статус тикетов\n\n"
-    "Выбери действие:"
+    "Я — <b>Зефирка</b> 🍬\n"
+    "мульти-функциональный помощник с AI, утилитами и мини-играми.\n\n"
+    "💰 Твои зефирки: <b>{zefirki}</b>\n\n"
+    "Выбери куда идём:"
+)
+
+CONTACT_TEXT = (
+    "📨 <b>Связь с владельцем</b>\n\n"
+    "Здесь можно написать владельцу бота: задать вопрос, "
+    "сообщить о баге, предложить фичу.\n\n"
+    "📤 — отправлено, 👁 — просмотрено, ✅ — отвечено"
+)
+
+FUN_TEXT = (
+    "🎮 <b>Развлечения и утилиты</b>\n\n"
+    "🐱 <b>Зефир (AI)</b> — общение с умным котом\n"
+    "⛅ <b>Погода</b> — прогноз по любому городу\n"
+    "👤 <b>Мой профиль</b> — статистика, зефирки, лимиты\n\n"
+    "<i>Скоро: конвертер валют, QR, напоминалки, мини-игра с питомцем…</i>"
 )
 
 HELP_TEXT = (
-    "🆘 <b>Помощь</b>\n\n"
-    "<b>Кнопки меню:</b>\n"
-    "📨 <b>Написать админу</b> — создать тикет\n"
-    "🐱 <b>Зефир</b> — поболтать с AI-котом\n"
-    "⛅ <b>Погода</b> — прогноз в любом городе\n"
-    "👤 <b>Мой профиль</b> — лимиты AI, статус тикетов\n"
-    "📊 <b>Мои тикеты</b> — история обращений\n\n"
+    "🆘 <b>Помощь по Зефирке</b>\n\n"
+    "<b>Главное меню — две двери:</b>\n"
+    "📨 <b>Связаться с владельцем</b> — тикеты, написать, посмотреть ответы\n"
+    "🎮 <b>Развлечения и утилиты</b> — AI, погода, профиль и всё остальное\n\n"
     "<b>Команды:</b>\n"
     "/start — главное меню\n"
     "/help — эта справка\n"
     "/weather [город] — быстрая погода\n"
-    "/admin — панель админа"
+    "/admin — панель владельца\n\n"
+    "💰 За активность начисляются <b>зефирки</b> — внутренняя валюта, "
+    "которую можно тратить на бонусы и игровые штуки."
 )
 
 
 async def _render_fresh_menu(bot: Bot, chat_id: int, user_id: int, text: str) -> None:
-    """Delete previously tracked menu message, send a new one, track its id."""
+    """Удаляет ранее отправленное меню и шлёт свежее. Против спама /start."""
     prev_id = await get_last_menu_msg_id(user_id)
     if prev_id:
         try:
@@ -46,14 +57,20 @@ async def _render_fresh_menu(bot: Bot, chat_id: int, user_id: int, text: str) ->
     await set_last_menu_msg_id(user_id, msg.message_id)
 
 
+async def _welcome_text(user_id: int, first_name: str | None) -> str:
+    zefirki = await get_zefirki_balance(user_id)
+    name = first_name or "друг"
+    return WELCOME_TEXT.format(name=name, zefirki=zefirki)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
     try:
         await message.delete()
     except Exception:
         pass
-    name = message.from_user.first_name or "друг"
-    await _render_fresh_menu(bot, message.chat.id, message.from_user.id, WELCOME_TEXT.format(name=name))
+    text = await _welcome_text(message.from_user.id, message.from_user.first_name)
+    await _render_fresh_menu(bot, message.chat.id, message.from_user.id, text)
 
 
 @router.message(Command("help"))
@@ -62,16 +79,41 @@ async def cmd_help(message: Message, bot: Bot):
         await message.delete()
     except Exception:
         pass
-    await _render_fresh_menu(bot, message.chat.id, message.from_user.id, HELP_TEXT)
+    prev_id = await get_last_menu_msg_id(message.from_user.id)
+    if prev_id:
+        try:
+            await bot.delete_message(message.chat.id, prev_id)
+        except Exception:
+            pass
+    msg = await bot.send_message(message.chat.id, HELP_TEXT, reply_markup=main_menu())
+    await set_last_menu_msg_id(message.from_user.id, msg.message_id)
 
 
 @router.callback_query(F.data == "menu:main")
 async def cb_main_menu(callback: CallbackQuery):
-    name = callback.from_user.first_name or "друг"
+    text = await _welcome_text(callback.from_user.id, callback.from_user.first_name)
     try:
-        await callback.message.edit_text(
-            WELCOME_TEXT.format(name=name), reply_markup=main_menu()
-        )
+        await callback.message.edit_text(text, reply_markup=main_menu())
+        await set_last_menu_msg_id(callback.from_user.id, callback.message.message_id)
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:contact")
+async def cb_contact(callback: CallbackQuery):
+    try:
+        await callback.message.edit_text(CONTACT_TEXT, reply_markup=contact_submenu())
+        await set_last_menu_msg_id(callback.from_user.id, callback.message.message_id)
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:fun")
+async def cb_fun(callback: CallbackQuery):
+    try:
+        await callback.message.edit_text(FUN_TEXT, reply_markup=fun_submenu())
         await set_last_menu_msg_id(callback.from_user.id, callback.message.message_id)
     except Exception:
         pass

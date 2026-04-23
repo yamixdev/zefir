@@ -11,7 +11,7 @@ from bot.models import create_ticket, get_user_tickets, get_ticket, get_user, se
 from bot.services.ai_service import summarize_ticket
 from bot.utils import tg_safe
 
-logger = logging.getLogger("зефир.тикеты")
+logger = logging.getLogger("зефирка.тикеты")
 router = Router()
 
 

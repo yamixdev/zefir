@@ -8,7 +8,7 @@ from aiogram.types import Message, CallbackQuery
 
 from bot.config import config
 
-logger = logging.getLogger("зефир.админ")
+logger = logging.getLogger("зефирка.админ")
 from bot.keyboards.inline import (
     admin_menu, admin_tickets_list, admin_ticket_actions,
     admin_users_list, admin_user_actions, confirm_action, main_menu,
