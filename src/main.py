@@ -6,7 +6,7 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import Update
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat, Update
 
 from bot.config import config
 from bot.db import init_db, close_db
@@ -14,6 +14,19 @@ from bot.handlers import setup_routers
 from bot.logging_ru import install_ru_localization
 from bot.middlewares.user_register import UserRegisterMiddleware
 from bot.middlewares.rate_limit import RateLimitMiddleware
+
+PUBLIC_COMMANDS = [
+    BotCommand(command="start",   description="🏠 Главное меню"),
+    BotCommand(command="help",    description="🆘 Помощь"),
+    BotCommand(command="weather", description="⛅ Погода (опц. город)"),
+    BotCommand(command="convert", description="💱 Конвертер: /convert 100 USD RUB"),
+    BotCommand(command="rates",   description="📈 Курсы ЦБ РФ"),
+    BotCommand(command="qr",      description="🔳 QR: /qr текст"),
+]
+
+ADMIN_COMMANDS = PUBLIC_COMMANDS + [
+    BotCommand(command="admin", description="👑 Админ-панель"),
+]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,8 +50,29 @@ dp.callback_query.outer_middleware(UserRegisterMiddleware())
 dp.message.outer_middleware(RateLimitMiddleware())
 
 
+_commands_set = False
+
+
+async def _setup_commands():
+    """Вызываем один раз на процесс (в YCF — на cold start)."""
+    global _commands_set
+    if _commands_set:
+        return
+    _commands_set = True
+    try:
+        await bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+        for admin_id in config.admins:
+            try:
+                await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
+            except Exception as e:
+                logger.warning("🍬 Не смогла выставить команды админу %s: %s", admin_id, e)
+    except Exception as e:
+        logger.warning("🍬 Не смогла выставить команды: %s", e)
+
+
 async def on_startup():
     await init_db()
+    await _setup_commands()
     logger.info("🍬 Зефирка запущена, БД подключена")
 
 

@@ -24,7 +24,11 @@ def fun_submenu() -> InlineKeyboardMarkup:
     """Подменю «Развлечения и утилиты». Сюда будут добавляться новые фичи."""
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="🐱 Зефир (AI)", callback_data="ai:start"))
-    kb.row(InlineKeyboardButton(text="⛅ Погода", callback_data="weather:ask"))
+    kb.row(
+        InlineKeyboardButton(text="⛅ Погода", callback_data="weather:ask"),
+        InlineKeyboardButton(text="💱 Конвертер", callback_data="conv:start"),
+    )
+    kb.row(InlineKeyboardButton(text="🔳 QR-код", callback_data="qr:start"))
     kb.row(InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile:me"))
     kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
     return kb.as_markup()
