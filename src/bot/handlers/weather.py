@@ -27,7 +27,7 @@ class WeatherStates(StatesGroup):
 
 def _ask_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:fun")],
     ])
 
 
@@ -49,7 +49,7 @@ def _periods_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📆 7 дней", callback_data="weather:period:7d"),
         ],
         [InlineKeyboardButton(text="🔁 Другой город", callback_data="weather:ask")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:fun")],
     ])
 
 
@@ -61,7 +61,7 @@ def _result_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📆 7 дней", callback_data="weather:period:7d"),
         ],
         [InlineKeyboardButton(text="🔁 Другой город", callback_data="weather:ask")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:fun")],
     ])
 
 

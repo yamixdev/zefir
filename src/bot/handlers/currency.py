@@ -16,6 +16,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.services.currency_service import POPULAR, convert, flag, get_rates
+from bot.utils import smart_edit
 
 router = Router()
 
@@ -37,14 +38,14 @@ def _pick_keyboard(action: str, exclude: str | None = None) -> InlineKeyboardMar
             row = []
     if row:
         kb.row(*row)
-    kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
+    kb.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:fun"))
     return kb.as_markup()
 
 
 def _back_to_from() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔁 Ещё раз", callback_data="conv:start")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:fun")],
     ])
 
 
@@ -64,10 +65,7 @@ async def cb_conv_start(callback: CallbackQuery, state: FSMContext):
         "Курсы от ЦБ РФ, обновляются раз в сутки.\n\n"
         "<b>Из какой валюты</b> конвертируем?"
     )
-    try:
-        await callback.message.edit_text(text, reply_markup=_pick_keyboard("from"))
-    except Exception:
-        pass
+    await smart_edit(callback, text, reply_markup=_pick_keyboard("from"))
     await callback.answer()
 
 
@@ -193,7 +191,7 @@ async def cmd_convert(message: Message, command: CommandObject, bot: Bot):
         pass
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💱 Меню конвертера", callback_data="conv:start")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun")],
     ])
     args = (command.args or "").split()
     if len(args) != 3:
@@ -247,6 +245,6 @@ async def cmd_rates(message: Message, bot: Bot):
         lines.append(f"{flag(code)} <b>{code}</b> — {_format_amount(c.rate_rub)} ₽")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💱 Конвертер", callback_data="conv:start")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun")],
     ])
     await bot.send_message(message.chat.id, "\n".join(lines), reply_markup=kb)

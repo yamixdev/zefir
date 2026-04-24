@@ -2,8 +2,10 @@ from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 
+from bot.config import config
 from bot.keyboards.inline import main_menu, contact_submenu, fun_submenu
 from bot.models import get_last_menu_msg_id, set_last_menu_msg_id, get_zefirki_balance
+from bot.utils import smart_edit
 
 router = Router()
 
@@ -32,7 +34,7 @@ FUN_TEXT = (
     "<i>Скоро: напоминалки, сканер QR из фото, мини-игра с питомцем…</i>"
 )
 
-HELP_TEXT = (
+_HELP_HEAD = (
     "🆘 <b>Помощь по Зефирке</b>\n\n"
     "<b>Главное меню — две двери:</b>\n"
     "📨 <b>Связаться с владельцем</b> — тикеты, написать, посмотреть ответы\n"
@@ -43,12 +45,20 @@ HELP_TEXT = (
     "/weather [город] — быстрая погода\n"
     "/convert 100 USD RUB — разовая конвертация\n"
     "/rates — курсы валют ЦБ РФ\n"
-    "/qr &lt;текст&gt; — QR-код одной строкой\n"
-    "/admin — панель владельца\n\n"
-    "<i>Или тыкай кнопки — так удобнее.</i>\n\n"
+    "/qr &lt;текст&gt; — QR-код одной строкой"
+)
+
+_HELP_ADMIN = "\n/admin — панель владельца"
+
+_HELP_TAIL = (
+    "\n\n<i>Или тыкай кнопки — так удобнее.</i>\n\n"
     "💰 За активность начисляются <b>зефирки</b> — внутренняя валюта, "
     "которую можно тратить на бонусы и игровые штуки."
 )
+
+
+def _help_text(user_id: int) -> str:
+    return _HELP_HEAD + (_HELP_ADMIN if config.is_admin(user_id) else "") + _HELP_TAIL
 
 
 async def _render_fresh_menu(bot: Bot, chat_id: int, user_id: int, text: str) -> None:
@@ -91,36 +101,34 @@ async def cmd_help(message: Message, bot: Bot):
             await bot.delete_message(message.chat.id, prev_id)
         except Exception:
             pass
-    msg = await bot.send_message(message.chat.id, HELP_TEXT, reply_markup=main_menu())
+    msg = await bot.send_message(
+        message.chat.id,
+        _help_text(message.from_user.id),
+        reply_markup=main_menu(),
+    )
     await set_last_menu_msg_id(message.from_user.id, msg.message_id)
 
 
 @router.callback_query(F.data == "menu:main")
 async def cb_main_menu(callback: CallbackQuery):
     text = await _welcome_text(callback.from_user.id, callback.from_user.first_name)
-    try:
-        await callback.message.edit_text(text, reply_markup=main_menu())
-        await set_last_menu_msg_id(callback.from_user.id, callback.message.message_id)
-    except Exception:
-        pass
+    new_msg = await smart_edit(callback, text, reply_markup=main_menu())
+    if new_msg:
+        await set_last_menu_msg_id(callback.from_user.id, new_msg.message_id)
     await callback.answer()
 
 
 @router.callback_query(F.data == "menu:contact")
 async def cb_contact(callback: CallbackQuery):
-    try:
-        await callback.message.edit_text(CONTACT_TEXT, reply_markup=contact_submenu())
-        await set_last_menu_msg_id(callback.from_user.id, callback.message.message_id)
-    except Exception:
-        pass
+    new_msg = await smart_edit(callback, CONTACT_TEXT, reply_markup=contact_submenu())
+    if new_msg:
+        await set_last_menu_msg_id(callback.from_user.id, new_msg.message_id)
     await callback.answer()
 
 
 @router.callback_query(F.data == "menu:fun")
 async def cb_fun(callback: CallbackQuery):
-    try:
-        await callback.message.edit_text(FUN_TEXT, reply_markup=fun_submenu())
-        await set_last_menu_msg_id(callback.from_user.id, callback.message.message_id)
-    except Exception:
-        pass
+    new_msg = await smart_edit(callback, FUN_TEXT, reply_markup=fun_submenu())
+    if new_msg:
+        await set_last_menu_msg_id(callback.from_user.id, new_msg.message_id)
     await callback.answer()

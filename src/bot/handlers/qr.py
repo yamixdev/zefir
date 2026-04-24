@@ -13,6 +13,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.services.qr_service import make_qr_png
+from bot.utils import smart_edit
 
 router = Router()
 
@@ -26,29 +27,28 @@ class QRStates(StatesGroup):
 def _qr_back() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔁 Ещё QR", callback_data="qr:start")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:fun")],
     ])
 
 
 def _ask_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:fun")],
     ])
 
 
 @router.callback_query(F.data == "qr:start")
 async def cb_qr_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(QRStates.waiting_text)
-    await state.update_data(prompt_msg_id=callback.message.message_id)
     text = (
         "🔳 <b>QR-генератор</b>\n\n"
         "Пришли текст или ссылку — сделаю QR-код.\n"
         f"<i>До {MAX_QR_LEN} символов.</i>"
     )
-    try:
-        await callback.message.edit_text(text, reply_markup=_ask_kb())
-    except Exception:
-        pass
+    # Под QR-фото нельзя edit_text — smart_edit удалит фото и пришлёт свежее меню
+    new_msg = await smart_edit(callback, text, reply_markup=_ask_kb())
+    prompt_id = new_msg.message_id if new_msg else callback.message.message_id
+    await state.set_state(QRStates.waiting_text)
+    await state.update_data(prompt_msg_id=prompt_id)
     await callback.answer()
 
 
