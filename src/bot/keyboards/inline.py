@@ -23,7 +23,18 @@ def contact_submenu() -> InlineKeyboardMarkup:
 def fun_submenu() -> InlineKeyboardMarkup:
     """Подменю «Развлечения и утилиты». Порядок от самого важного."""
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile:me"))
+    kb.row(
+        InlineKeyboardButton(text="🎮 Игры", callback_data="games:home"),
+        InlineKeyboardButton(text="🐾 Питомцы", callback_data="pet:home"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🛒 Магазин", callback_data="shop:home"),
+        InlineKeyboardButton(text="🏪 Рынок", callback_data="econ:market"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🎒 Инвентарь", callback_data="econ:inv"),
+        InlineKeyboardButton(text="👤 Профиль", callback_data="profile:me"),
+    )
     kb.row(
         InlineKeyboardButton(text="⛅ Погода", callback_data="weather:ask"),
         InlineKeyboardButton(text="💱 Конвертер", callback_data="conv:start"),
@@ -34,6 +45,23 @@ def fun_submenu() -> InlineKeyboardMarkup:
     )
     kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
     return kb.as_markup()
+
+
+def fun_consent_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Правила", callback_data="funconsent:tos")],
+        [InlineKeyboardButton(text="🔒 Данные", callback_data="funconsent:privacy")],
+        [
+            InlineKeyboardButton(text="✅ Принимаю", callback_data="funconsent:accept"),
+            InlineKeyboardButton(text="❌ Отказаться", callback_data="funconsent:decline"),
+        ],
+    ])
+
+
+def fun_consent_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К выбору", callback_data="funconsent:show")],
+    ])
 
 
 # ── AI chat ──────────────────────────────────────────────────────
@@ -117,8 +145,28 @@ def weather_back() -> InlineKeyboardMarkup:
 
 def profile_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📊 Мои тикеты", callback_data="ticket:my"))
-    kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
+    kb.row(
+        InlineKeyboardButton(text="🎒 Инвентарь", callback_data="econ:inv"),
+        InlineKeyboardButton(text="🐾 Питомец", callback_data="pet:home"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="📊 Подробнее", callback_data="profile:me:details"),
+        InlineKeyboardButton(text="⬅️ Развлечения", callback_data="menu:fun"),
+    )
+    return kb.as_markup()
+
+
+def profile_details_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="🏪 Рынок", callback_data="econ:market"),
+        InlineKeyboardButton(text="🛒 Магазин", callback_data="shop:home"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🐱 AI", callback_data="ai:start"),
+        InlineKeyboardButton(text="📬 Тикеты", callback_data="ticket:my"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile:me"))
     return kb.as_markup()
 
 
@@ -126,16 +174,29 @@ def profile_menu() -> InlineKeyboardMarkup:
 
 def admin_profile_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="👑 Админ-панель", callback_data="adm:menu"))
     kb.row(
-        InlineKeyboardButton(text="📋 Открытые тикеты", callback_data="adm:tickets"),
-        InlineKeyboardButton(text="👥 Юзеры", callback_data="adm:users"),
+        InlineKeyboardButton(text="👑 Админ-панель", callback_data="adm:menu"),
+        InlineKeyboardButton(text="📊 Статистика", callback_data="profile:admin:stats"),
     )
     kb.row(
-        InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast"),
-        InlineKeyboardButton(text="🔄 Сброс лимитов", callback_data="adm:reset_limits"),
+        InlineKeyboardButton(text="🍬 Экономика", callback_data="adm:econ"),
+        InlineKeyboardButton(text="📋 Тикеты", callback_data="adm:tickets"),
     )
     kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
+    return kb.as_markup()
+
+
+def admin_profile_stats_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="👥 Юзеры", callback_data="adm:users"),
+        InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🔄 Сброс лимитов", callback_data="adm:reset_limits"),
+        InlineKeyboardButton(text="🍬 Экономика", callback_data="adm:econ"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅️ Профиль", callback_data="profile:admin"))
     return kb.as_markup()
 
 
@@ -155,6 +216,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast"),
         InlineKeyboardButton(text="👑 Мой профиль", callback_data="profile:admin"),
     )
+    kb.row(InlineKeyboardButton(text="🍬 Экономика", callback_data="adm:econ"))
     kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
     return kb.as_markup()
 

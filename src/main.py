@@ -14,6 +14,7 @@ from bot.handlers import setup_routers
 from bot.logging_ru import install_ru_localization
 from bot.middlewares.user_register import UserRegisterMiddleware
 from bot.middlewares.rate_limit import RateLimitMiddleware
+from bot.middlewares.fun_consent import FunConsentMiddleware
 
 PUBLIC_COMMANDS = [
     BotCommand(command="start",   description="🏠 Главное меню"),
@@ -22,6 +23,13 @@ PUBLIC_COMMANDS = [
     BotCommand(command="convert", description="💱 Конвертер: /convert 100 USD RUB"),
     BotCommand(command="rates",   description="📈 Курсы ЦБ РФ"),
     BotCommand(command="qr",      description="🔳 QR: /qr текст"),
+    BotCommand(command="inventory", description="🎒 Инвентарь"),
+    BotCommand(command="cases",   description="📦 Кейсы"),
+    BotCommand(command="market",  description="🏪 Рынок"),
+    BotCommand(command="shop",    description="🛒 Магазин"),
+    BotCommand(command="pet",     description="🐾 Питомец"),
+    BotCommand(command="games",   description="🎮 Игры"),
+    BotCommand(command="join",    description="🚪 Войти в PvP-комнату: /join код"),
 ]
 
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
@@ -47,6 +55,8 @@ dp.include_router(setup_routers())
 # Middlewares (outer = first to run)
 dp.message.outer_middleware(UserRegisterMiddleware())
 dp.callback_query.outer_middleware(UserRegisterMiddleware())
+dp.message.outer_middleware(FunConsentMiddleware())
+dp.callback_query.outer_middleware(FunConsentMiddleware())
 dp.message.outer_middleware(RateLimitMiddleware())
 
 

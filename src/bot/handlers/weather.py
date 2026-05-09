@@ -17,6 +17,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot.services.weather_service import format_5day, format_7day, format_current, geocode
+from bot.utils import render_clean_message
 
 router = Router()
 
@@ -104,8 +105,10 @@ async def cmd_weather(message: Message, state: FSMContext, bot: Bot):
         await _process_city(bot, message.chat.id, args[1].strip(), state, prompt_msg_id=None)
     else:
         await state.set_state(WeatherStates.waiting_city)
-        msg = await bot.send_message(
+        msg = await render_clean_message(
+            bot,
             message.chat.id,
+            message.from_user.id,
             "⛅ <b>Погода</b>\n\nВведи название города:",
             reply_markup=_ask_kb(),
         )

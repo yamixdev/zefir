@@ -16,7 +16,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.services.currency_service import POPULAR, convert, flag, get_rates
-from bot.utils import smart_edit
+from bot.utils import render_clean_message, smart_edit
 
 router = Router()
 
@@ -195,8 +195,10 @@ async def cmd_convert(message: Message, command: CommandObject, bot: Bot):
     ])
     args = (command.args or "").split()
     if len(args) != 3:
-        await bot.send_message(
+        await render_clean_message(
+            bot,
             message.chat.id,
+            message.from_user.id,
             "💱 <b>Конвертер</b>\n\n"
             "Формат: <code>/convert 100 USD RUB</code>\n"
             "Или используй меню.",
@@ -208,14 +210,16 @@ async def cmd_convert(message: Message, command: CommandObject, bot: Bot):
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await bot.send_message(message.chat.id, "❌ Сумма должна быть положительным числом.", reply_markup=kb)
+        await render_clean_message(bot, message.chat.id, message.from_user.id, "❌ Сумма должна быть положительным числом.", reply_markup=kb)
         return
     src = args[1].upper()
     dst = args[2].upper()
     result = await convert(amount, src, dst)
     if result is None:
-        await bot.send_message(
+        await render_clean_message(
+            bot,
             message.chat.id,
+            message.from_user.id,
             f"❌ Не знаю одну из валют ({src} или {dst}). Попробуй через меню.",
             reply_markup=kb,
         )
@@ -227,7 +231,7 @@ async def cmd_convert(message: Message, command: CommandObject, bot: Bot):
         f"<b>{_format_amount(result)}</b> {flag(dst)} {dst}\n\n"
         "<i>Курс ЦБ РФ на сегодня</i>"
     )
-    await bot.send_message(message.chat.id, text, reply_markup=kb)
+    await render_clean_message(bot, message.chat.id, message.from_user.id, text, reply_markup=kb)
 
 
 @router.message(Command("rates"))
@@ -247,4 +251,4 @@ async def cmd_rates(message: Message, bot: Bot):
         [InlineKeyboardButton(text="💱 Конвертер", callback_data="conv:start")],
         [InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun")],
     ])
-    await bot.send_message(message.chat.id, "\n".join(lines), reply_markup=kb)
+    await render_clean_message(bot, message.chat.id, message.from_user.id, "\n".join(lines), reply_markup=kb)

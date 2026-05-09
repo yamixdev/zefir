@@ -3,8 +3,26 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 
 from bot.config import config
-from bot.keyboards.inline import main_menu, contact_submenu, fun_submenu
-from bot.models import get_last_menu_msg_id, set_last_menu_msg_id, get_zefirki_balance
+from bot.keyboards.inline import (
+    fun_consent_back,
+    fun_consent_menu,
+    main_menu,
+    contact_submenu,
+    fun_submenu,
+)
+from bot.models import (
+    accept_consent,
+    get_last_menu_msg_id,
+    set_last_menu_msg_id,
+    get_zefirki_balance,
+)
+from bot.services.consent import (
+    FUN_CONSENT_INTRO,
+    FUN_CONSENT_VERSION,
+    FUN_PRIVACY_TEXT,
+    FUN_TOS_TEXT,
+    fun_docs_hash,
+)
 from bot.utils import smart_edit
 
 router = Router()
@@ -26,12 +44,16 @@ CONTACT_TEXT = (
 
 FUN_TEXT = (
     "🎮 <b>Развлечения и утилиты</b>\n\n"
+    "🎒 <b>Инвентарь</b> — предметы, редкости, использование\n"
+    "📦 <b>Кейсы</b> — награды за зефирки\n"
+    "🏪 <b>Рынок</b> — торговля предметами с комиссией\n"
+    "🐾 <b>Питомец</b> — уход, опыт и ежедневные награды\n"
+    "🎮 <b>Игры</b> — сапёр и PvP-комнаты\n"
     "🐱 <b>Зефир (AI)</b> — общение с умным котом\n"
     "⛅ <b>Погода</b> — прогноз сейчас / 5 / 7 дней\n"
     "💱 <b>Конвертер валют</b> — курсы ЦБ РФ\n"
     "🔳 <b>QR-код</b> — генератор из текста/ссылки\n"
-    "👤 <b>Мой профиль</b> — статистика, зефирки, лимиты\n\n"
-    "<i>Скоро: напоминалки, сканер QR из фото, мини-игра с питомцем…</i>"
+    "👤 <b>Мой профиль</b> — статистика, зефирки, лимиты"
 )
 
 _HELP_HEAD = (
@@ -45,7 +67,14 @@ _HELP_HEAD = (
     "/weather [город] — быстрая погода\n"
     "/convert 100 USD RUB — разовая конвертация\n"
     "/rates — курсы валют ЦБ РФ\n"
-    "/qr &lt;текст&gt; — QR-код одной строкой"
+    "/qr &lt;текст&gt; — QR-код одной строкой\n"
+    "/inventory — инвентарь\n"
+    "/cases — кейсы\n"
+    "/shop — магазин\n"
+    "/market — рынок\n"
+    "/pet — питомец\n"
+    "/games — игры\n"
+    "/join &lt;код&gt; — войти в PvP-комнату"
 )
 
 _HELP_ADMIN = "\n/admin — панель владельца"
@@ -132,3 +161,49 @@ async def cb_fun(callback: CallbackQuery):
     if new_msg:
         await set_last_menu_msg_id(callback.from_user.id, new_msg.message_id)
     await callback.answer()
+
+
+@router.callback_query(F.data == "funconsent:show")
+async def cb_fun_consent_show(callback: CallbackQuery):
+    new_msg = await smart_edit(callback, FUN_CONSENT_INTRO, reply_markup=fun_consent_menu())
+    if new_msg:
+        await set_last_menu_msg_id(callback.from_user.id, new_msg.message_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "funconsent:tos")
+async def cb_fun_consent_tos(callback: CallbackQuery):
+    await smart_edit(
+        callback,
+        f"{FUN_TOS_TEXT}\n\n<i>Версия {FUN_CONSENT_VERSION}</i>",
+        reply_markup=fun_consent_back(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "funconsent:privacy")
+async def cb_fun_consent_privacy(callback: CallbackQuery):
+    await smart_edit(
+        callback,
+        f"{FUN_PRIVACY_TEXT}\n\n<i>Версия {FUN_CONSENT_VERSION}</i>",
+        reply_markup=fun_consent_back(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "funconsent:accept")
+async def cb_fun_consent_accept(callback: CallbackQuery):
+    await accept_consent(callback.from_user.id, FUN_CONSENT_VERSION, fun_docs_hash())
+    new_msg = await smart_edit(callback, FUN_TEXT, reply_markup=fun_submenu())
+    if new_msg:
+        await set_last_menu_msg_id(callback.from_user.id, new_msg.message_id)
+    await callback.answer("Документы приняты")
+
+
+@router.callback_query(F.data == "funconsent:decline")
+async def cb_fun_consent_decline(callback: CallbackQuery):
+    text = await _welcome_text(callback.from_user.id, callback.from_user.first_name)
+    new_msg = await smart_edit(callback, text, reply_markup=main_menu())
+    if new_msg:
+        await set_last_menu_msg_id(callback.from_user.id, new_msg.message_id)
+    await callback.answer("Развлечения закрыты до принятия документов")

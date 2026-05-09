@@ -19,6 +19,9 @@ class Config:
     ai_limit_hours: int = int(os.getenv("AI_LIMIT_HOURS", "12"))
     ai_history_limit: int = 30
     message_cooldown_sec: int = 3
+    market_commission_percent: int = int(os.getenv("MARKET_COMMISSION_PERCENT", "25"))
+    game_daily_win_limit: int = int(os.getenv("GAME_DAILY_WIN_LIMIT", "300"))
+    ttt_turn_timeout_minutes: int = int(os.getenv("TTT_TURN_TIMEOUT_MINUTES", "15"))
 
     def __post_init__(self):
         raw = os.getenv("ADMINS", "")
