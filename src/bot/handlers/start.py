@@ -17,6 +17,7 @@ from bot.models import (
     get_zefirki_balance,
 )
 from bot.services.consent import (
+    FUN_CONSENT_EFFECTIVE_TEXT,
     FUN_CONSENT_INTRO,
     FUN_CONSENT_VERSION,
     FUN_PRIVACY_TEXT,
@@ -175,7 +176,7 @@ async def cb_fun_consent_show(callback: CallbackQuery):
 async def cb_fun_consent_tos(callback: CallbackQuery):
     await smart_edit(
         callback,
-        f"{FUN_TOS_TEXT}\n\n<i>Версия {FUN_CONSENT_VERSION}</i>",
+        f"{FUN_TOS_TEXT}\n\n<i>{FUN_CONSENT_EFFECTIVE_TEXT}</i>",
         reply_markup=fun_consent_back(),
     )
     await callback.answer()
@@ -185,7 +186,7 @@ async def cb_fun_consent_tos(callback: CallbackQuery):
 async def cb_fun_consent_privacy(callback: CallbackQuery):
     await smart_edit(
         callback,
-        f"{FUN_PRIVACY_TEXT}\n\n<i>Версия {FUN_CONSENT_VERSION}</i>",
+        f"{FUN_PRIVACY_TEXT}\n\n<i>{FUN_CONSENT_EFFECTIVE_TEXT}</i>",
         reply_markup=fun_consent_back(),
     )
     await callback.answer()
