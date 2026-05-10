@@ -441,6 +441,193 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
                 ON pet_reactions (species, action, mood, text);
         """,
     ),
+    (
+        "20260509_001_ranked_game_sessions",
+        """
+            CREATE TABLE IF NOT EXISTS game_sessions (
+                id              TEXT PRIMARY KEY,
+                game_type       TEXT NOT NULL,
+                mode            TEXT NOT NULL DEFAULT 'pvp',
+                status          TEXT NOT NULL DEFAULT 'waiting',
+                creator_id      BIGINT NOT NULL REFERENCES users(user_id),
+                chat_id         BIGINT,
+                stake           INT NOT NULL DEFAULT 0,
+                ranked          BOOLEAN NOT NULL DEFAULT FALSE,
+                min_players     INT NOT NULL DEFAULT 2,
+                max_players     INT NOT NULL DEFAULT 2,
+                current_turn_id BIGINT REFERENCES users(user_id),
+                winner_id       BIGINT REFERENCES users(user_id),
+                result          TEXT,
+                state           JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ DEFAULT NOW(),
+                expires_at      TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '30 minutes'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_game_sessions_status_created
+                ON game_sessions (status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_game_sessions_type_status
+                ON game_sessions (game_type, status, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS game_session_players (
+                session_id TEXT NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
+                user_id    BIGINT NOT NULL REFERENCES users(user_id),
+                username   TEXT,
+                first_name TEXT,
+                seat       INT NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'active',
+                joined_at  TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (session_id, user_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_game_session_players_seat
+                ON game_session_players (session_id, seat);
+
+            CREATE TABLE IF NOT EXISTS game_session_messages (
+                session_id TEXT NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
+                user_id    BIGINT NOT NULL REFERENCES users(user_id),
+                chat_id    BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (session_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS game_chat_messages (
+                id           BIGSERIAL PRIMARY KEY,
+                session_id   TEXT NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
+                user_id      BIGINT NOT NULL REFERENCES users(user_id),
+                display_name TEXT NOT NULL,
+                text         TEXT NOT NULL,
+                created_at   TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_game_chat_messages_session_created
+                ON game_chat_messages (session_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS rating_seasons (
+                id         SERIAL PRIMARY KEY,
+                code       TEXT UNIQUE NOT NULL,
+                starts_at  TIMESTAMPTZ NOT NULL,
+                ends_at    TIMESTAMPTZ NOT NULL,
+                status     TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_rating_one_active
+                ON rating_seasons (status) WHERE status = 'active';
+
+            CREATE TABLE IF NOT EXISTS user_ratings (
+                season_id      INT NOT NULL REFERENCES rating_seasons(id) ON DELETE CASCADE,
+                user_id        BIGINT NOT NULL REFERENCES users(user_id),
+                elo            INT NOT NULL DEFAULT 1000,
+                wins           INT NOT NULL DEFAULT 0,
+                losses         INT NOT NULL DEFAULT 0,
+                draws          INT NOT NULL DEFAULT 0,
+                games          INT NOT NULL DEFAULT 0,
+                reward_claimed BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at     TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (season_id, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_ratings_leaderboard
+                ON user_ratings (season_id, elo DESC, games DESC);
+
+            CREATE TABLE IF NOT EXISTS ranked_game_results (
+                id         BIGSERIAL PRIMARY KEY,
+                season_id  INT NOT NULL REFERENCES rating_seasons(id),
+                session_id TEXT NOT NULL UNIQUE,
+                game_type  TEXT NOT NULL,
+                user_a     BIGINT NOT NULL REFERENCES users(user_id),
+                user_b     BIGINT NOT NULL REFERENCES users(user_id),
+                winner_id  BIGINT REFERENCES users(user_id),
+                is_draw    BOOLEAN NOT NULL DEFAULT FALSE,
+                old_a      INT NOT NULL,
+                old_b      INT NOT NULL,
+                new_a      INT NOT NULL,
+                new_b      INT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            INSERT INTO rating_seasons (code, starts_at, ends_at, status)
+            SELECT 'season-' || TO_CHAR(CURRENT_DATE, 'YYYYMMDD'),
+                   NOW(),
+                   NOW() + INTERVAL '14 days',
+                   'active'
+            WHERE NOT EXISTS (SELECT 1 FROM rating_seasons WHERE status = 'active');
+        """,
+    ),
+    (
+        "20260509_002_news_and_quiz_ranked",
+        """
+            CREATE TABLE IF NOT EXISTS news_posts (
+                id                  BIGSERIAL PRIMARY KEY,
+                kind                TEXT NOT NULL DEFAULT 'news',
+                title               TEXT NOT NULL,
+                body                TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'draft',
+                release_version     TEXT,
+                notify              BOOLEAN NOT NULL DEFAULT TRUE,
+                published_at        TIMESTAMPTZ,
+                notification_until  TIMESTAMPTZ,
+                created_by          BIGINT REFERENCES users(user_id),
+                created_at          TIMESTAMPTZ DEFAULT NOW(),
+                updated_at          TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_news_posts_status_published
+                ON news_posts (status, published_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_news_posts_kind_published
+                ON news_posts (kind, published_at DESC);
+
+            CREATE TABLE IF NOT EXISTS user_news_settings (
+                user_id             BIGINT PRIMARY KEY REFERENCES users(user_id),
+                notify_mode         TEXT NOT NULL DEFAULT 'all',
+                last_seen_post_id   BIGINT REFERENCES news_posts(id),
+                notice_post_id      BIGINT REFERENCES news_posts(id),
+                notice_msg_id       BIGINT,
+                notice_sent_at      TIMESTAMPTZ,
+                updated_at          TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'ranked_game_results_session_id_key'
+                ) THEN
+                    ALTER TABLE ranked_game_results DROP CONSTRAINT ranked_game_results_session_id_key;
+                END IF;
+            END $$;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_ranked_game_results_pair
+                ON ranked_game_results (session_id, user_a, user_b);
+        """,
+    ),
+    (
+        "20260510_001_prod_stabilization",
+        """
+            CREATE TABLE IF NOT EXISTS game_scheduled_events (
+                id           BIGSERIAL PRIMARY KEY,
+                session_id   TEXT NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
+                event_type   TEXT NOT NULL,
+                run_at       TIMESTAMPTZ NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                payload      JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at   TIMESTAMPTZ DEFAULT NOW(),
+                processed_at TIMESTAMPTZ
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_game_scheduled_events_due
+                ON game_scheduled_events (status, run_at);
+            CREATE INDEX IF NOT EXISTS idx_game_session_players_user
+                ON game_session_players (user_id, session_id);
+            CREATE INDEX IF NOT EXISTS idx_game_sessions_status_expires
+                ON game_sessions (status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_game_sessions_creator_status
+                ON game_sessions (creator_id, status);
+            CREATE INDEX IF NOT EXISTS idx_market_listings_status_item_created
+                ON market_listings (status, item_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_news_posts_notice_due
+                ON news_posts (status, notification_until, published_at DESC);
+        """,
+    ),
 )
 
 
@@ -494,7 +681,10 @@ async def seed_default_content(conn) -> None:
                 ('toy_mouse', 'Игрушечная мышь', 'Игрушка для активной игры.', 'common', 'pet_toy', 'toy', '{"mood": 12, "energy": -8, "xp": 10}'::jsonb, 45, 80, TRUE, TRUE, TRUE),
                 ('music_speaker', 'Мини-колонка', 'Включает питомцу музыку и поднимает настроение.', 'rare', 'pet_toy', 'tech', '{"mood": 22, "energy": 3, "xp": 8}'::jsonb, 220, 360, TRUE, TRUE, TRUE),
                 ('red_cap', 'Рыжая кепка', 'Стильная кепка для питомца.', 'uncommon', 'cosmetic', 'clothes', '{}'::jsonb, 95, 150, TRUE, TRUE, FALSE),
-                ('squirrel_hoodie', 'Худи Белочки', 'Мемный образ для самых шумных прогулок.', 'epic', 'cosmetic', 'clothes', '{}'::jsonb, 400, 650, TRUE, TRUE, FALSE)
+                ('squirrel_hoodie', 'Худи Белочки', 'Мемный образ для самых шумных прогулок.', 'epic', 'cosmetic', 'clothes', '{}'::jsonb, 400, 650, TRUE, TRUE, FALSE),
+                ('season_crown_legend', 'Корона сезона', 'Легендарная награда за первое место в ranked-сезоне.', 'legendary', 'cosmetic', 'clothes', '{}'::jsonb, 1200, NULL, FALSE, TRUE, FALSE),
+                ('season_medal_epic', 'Медаль дуэлянта', 'Эпическая награда за топ-3 ranked-сезона.', 'epic', 'cosmetic', 'clothes', '{}'::jsonb, 650, NULL, FALSE, TRUE, FALSE),
+                ('season_badge_rare', 'Значок рейтинга', 'Редкая награда за топ-10 ranked-сезона.', 'rare', 'cosmetic', 'clothes', '{}'::jsonb, 260, NULL, FALSE, TRUE, FALSE)
             ON CONFLICT (code) DO UPDATE
                 SET name = EXCLUDED.name,
                     description = EXCLUDED.description,

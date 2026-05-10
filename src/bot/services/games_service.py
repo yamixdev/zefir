@@ -393,10 +393,14 @@ async def join_ttt_room(user_id: int, room_id: str) -> dict:
         async with conn.transaction():
             cur = await conn.execute("SELECT * FROM game_rooms WHERE id = %s FOR UPDATE", (room_id,))
             room = await cur.fetchone()
-            if not room or room["status"] != "waiting":
+            if not room:
+                return {"ok": False, "error": "not_available"}
+            if user_id in (room["creator_id"], room["opponent_id"]) and room["status"] in ("waiting", "active"):
+                return {"ok": True, "room": room, "already_in_room": True}
+            if room["status"] != "waiting":
                 return {"ok": False, "error": "not_available"}
             if room["creator_id"] == user_id:
-                return {"ok": False, "error": "own_room", "room": room}
+                return {"ok": True, "room": room, "already_in_room": True}
             if not await _spend_stake(conn, user_id, room["stake"], room_id):
                 return {"ok": False, "error": "not_enough", "room": room}
             cur = await conn.execute(

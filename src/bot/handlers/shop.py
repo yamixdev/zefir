@@ -36,7 +36,7 @@ def _shop_kb(offers: list[dict]) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Одежда", callback_data="shop:cat:clothes"),
         InlineKeyboardButton(text="Техника", callback_data="shop:cat:tech"),
     )
-    for offer in offers[:8]:
+    for offer in offers[:5]:
         kb.row(InlineKeyboardButton(
             text=f"{RARITY_ICONS.get(offer['rarity'], '▫️')} {offer['name']} — {_money(offer['offer_price'])} 🍬",
             callback_data=f"shop:buy:{offer['offer_id']}",
@@ -47,7 +47,7 @@ def _shop_kb(offers: list[dict]) -> InlineKeyboardMarkup:
 
 
 async def _shop_text(user_id: int, category: str | None = None) -> tuple[str, list[dict]]:
-    offers = await list_shop_offers(category=category, limit=10)
+    offers = await list_shop_offers(category=category, limit=5)
     balance = await get_zefirki_balance(user_id)
     cat = CATEGORY_LABELS.get(category or "all", "витрина")
     lines = [
@@ -58,7 +58,7 @@ async def _shop_text(user_id: int, category: str | None = None) -> tuple[str, li
     ]
     if offers:
         lines.append("\n<b>Предложения:</b>")
-        for offer in offers[:8]:
+        for offer in offers[:5]:
             lines.append(
                 f"{RARITY_ICONS.get(offer['rarity'], '▫️')} "
                 f"<b>{html.escape(offer['name'])}</b> — <b>{_money(offer['offer_price'])}</b> 🍬"

@@ -199,6 +199,15 @@ async def cb_pet_action(callback: CallbackQuery):
         extra += "\n\n🎉 Уровень питомца вырос!"
     if result.get("item"):
         extra += f"\n\n🎁 Найден предмет: {item_label(result['item'])}"
+    if result.get("event"):
+        event = result["event"]
+        bonus_parts = []
+        if event.get("xp"):
+            bonus_parts.append(f"+{event['xp']} опыта")
+        if event.get("zefirki"):
+            bonus_parts.append(f"+{event['zefirki']} 🍬")
+        bonus = f"\nБонус: <b>{', '.join(bonus_parts)}</b>" if bonus_parts else ""
+        extra += f"\n\n🎲 <b>Случайное событие</b>\n<i>{html.escape(event['text'])}</i>{bonus}"
     text = (
         f"🐾 Ты выбрал действие: <b>{action_cfg['label']}</b>\n"
         f"Награда: <b>+{result['zefirki']}</b> 🍬{extra}\n\n"

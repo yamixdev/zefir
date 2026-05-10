@@ -230,6 +230,29 @@ async def list_cases(include_inactive: bool = False) -> list[dict]:
         return await cur.fetchall()
 
 
+async def get_case_rewards(case_id: int) -> list[dict]:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT cr.weight, i.*
+            FROM case_rewards cr
+            JOIN items i ON i.id = cr.item_id
+            WHERE cr.case_id = %s AND i.is_active = TRUE AND cr.weight > 0
+            ORDER BY cr.weight DESC, i.rarity, i.name
+            """,
+            (case_id,),
+        )
+        rows = await cur.fetchall()
+        total = sum(r["weight"] for r in rows) or 1
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["chance"] = row["weight"] * 100 / total
+            out.append(item)
+        return out
+
+
 @with_db_retry
 async def set_case_active(case_id: int, active: bool) -> bool:
     pool = await get_pool()
@@ -374,7 +397,7 @@ async def list_market(
     pool = await get_pool()
     async with pool.connection() as conn:
         params: list = []
-        where = "ml.status = 'active'"
+        where = "ml.status = 'active' AND i.is_active = TRUE"
         if rarity:
             if rarity == "rare_plus":
                 where += " AND i.rarity IN ('rare', 'epic', 'legendary')"
@@ -487,7 +510,7 @@ async def get_market_listing(listing_id: int) -> dict | None:
             FROM market_listings ml
             JOIN items i ON i.id = ml.item_id
             JOIN users u ON u.user_id = ml.seller_id
-            WHERE ml.id = %s
+            WHERE ml.id = %s AND i.is_active = TRUE
             """,
             (listing_id,),
         )
@@ -501,7 +524,7 @@ async def buy_listing(buyer_id: int, listing_id: int) -> dict:
         async with conn.transaction():
             cur = await conn.execute(
                 """
-                SELECT ml.*, i.name, i.rarity
+                SELECT ml.*, i.name, i.rarity, i.is_active
                 FROM market_listings ml
                 JOIN items i ON i.id = ml.item_id
                 WHERE ml.id = %s
@@ -512,6 +535,8 @@ async def buy_listing(buyer_id: int, listing_id: int) -> dict:
             listing = await cur.fetchone()
             if not listing or listing["status"] != "active":
                 return {"ok": False, "error": "not_available"}
+            if not listing.get("is_active", True):
+                return {"ok": False, "error": "item_disabled", "listing": listing}
             if listing["seller_id"] == buyer_id:
                 return {"ok": False, "error": "own_listing", "listing": listing}
 
@@ -788,11 +813,34 @@ async def claim_daily_freebie(user_id: int) -> dict:
 async def set_item_active(item_id: int, active: bool) -> bool:
     pool = await get_pool()
     async with pool.connection() as conn:
-        cur = await conn.execute(
-            "UPDATE items SET is_active = %s WHERE id = %s RETURNING id",
-            (active, item_id),
-        )
-        return await cur.fetchone() is not None
+        async with conn.transaction():
+            cur = await conn.execute(
+                "UPDATE items SET is_active = %s WHERE id = %s RETURNING id",
+                (active, item_id),
+            )
+            if not await cur.fetchone():
+                return False
+            if not active:
+                cur = await conn.execute(
+                    """
+                    UPDATE market_listings
+                       SET status = 'cancelled', closed_at = NOW()
+                     WHERE item_id = %s AND status = 'active'
+                    RETURNING id, seller_id
+                    """,
+                    (item_id,),
+                )
+                for listing in await cur.fetchall():
+                    await _add_inventory(conn, listing["seller_id"], item_id, 1)
+                    await _log_event(
+                        conn,
+                        listing["seller_id"],
+                        0,
+                        "market_cancel_item_disabled",
+                        item_id=item_id,
+                        listing_id=listing["id"],
+                    )
+        return True
 
 
 @with_db_retry

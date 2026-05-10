@@ -23,6 +23,12 @@ MODULES = (
     "bot.services.economy_service",
     "bot.services.pet_service",
     "bot.services.games_service",
+    "bot.services.game_logic",
+    "bot.services.game_session_service",
+    "bot.services.rating_service",
+    "bot.services.news_service",
+    "bot.services.quiz_ai_service",
+    "bot.handlers.news",
     "main",
 )
 

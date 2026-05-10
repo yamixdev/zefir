@@ -16,10 +16,19 @@ async def test_ttt_room_flow_winner_and_message_ids(conn):
     room = await set_ttt_message(room_id, creator_id, creator_id, 111)
     assert room["creator_msg_id"] == 111
 
+    reopened = await join_ttt_room(creator_id, room_id)
+    assert reopened["ok"] is True
+    assert reopened["already_in_room"] is True
+    assert reopened["room"]["creator_id"] == creator_id
+
     joined = await join_ttt_room(opponent_id, room_id)
     assert joined["ok"] is True
     room = await set_ttt_message(room_id, opponent_id, opponent_id, 222)
     assert room["opponent_msg_id"] == 222
+
+    reopened_opponent = await join_ttt_room(opponent_id, room_id)
+    assert reopened_opponent["ok"] is True
+    assert reopened_opponent["already_in_room"] is True
 
     assert (await ttt_move(creator_id, room_id, 0))["ok"] is True
     assert (await ttt_move(opponent_id, room_id, 3))["ok"] is True

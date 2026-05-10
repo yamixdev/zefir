@@ -15,10 +15,13 @@ from bot.logging_ru import install_ru_localization
 from bot.middlewares.user_register import UserRegisterMiddleware
 from bot.middlewares.rate_limit import RateLimitMiddleware
 from bot.middlewares.fun_consent import FunConsentMiddleware
+from bot.middlewares.news_notice import NewsNoticeMiddleware
 
 PUBLIC_COMMANDS = [
     BotCommand(command="start",   description="🏠 Главное меню"),
     BotCommand(command="help",    description="🆘 Помощь"),
+    BotCommand(command="news",    description="📰 Новости и апдейты"),
+    BotCommand(command="updates", description="🆕 Последний апдейт"),
     BotCommand(command="weather", description="⛅ Погода (опц. город)"),
     BotCommand(command="convert", description="💱 Конвертер: /convert 100 USD RUB"),
     BotCommand(command="rates",   description="📈 Курсы ЦБ РФ"),
@@ -55,12 +58,15 @@ dp.include_router(setup_routers())
 # Middlewares (outer = first to run)
 dp.message.outer_middleware(UserRegisterMiddleware())
 dp.callback_query.outer_middleware(UserRegisterMiddleware())
+dp.message.outer_middleware(NewsNoticeMiddleware())
+dp.callback_query.outer_middleware(NewsNoticeMiddleware())
 dp.message.outer_middleware(FunConsentMiddleware())
 dp.callback_query.outer_middleware(FunConsentMiddleware())
 dp.message.outer_middleware(RateLimitMiddleware())
 
 
 _commands_set = False
+_started = False
 
 
 async def _setup_commands():
@@ -81,36 +87,73 @@ async def _setup_commands():
 
 
 async def on_startup():
+    global _started
+    if _started:
+        return
     await init_db()
     await _setup_commands()
+    _started = True
     logger.info("🍬 Зефирка запущена, БД подключена")
 
 
 async def on_shutdown():
+    global _started
     await close_db()
     await bot.session.close()
+    _started = False
     logger.info("🔌 Зефирка остановлена, соединения закрыты")
 
 
 # ── Yandex Cloud Functions handler ──────────────────────────────
+def _job_token_from_event(event: dict) -> str:
+    headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
+    qs = event.get("queryStringParameters") or {}
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except Exception:
+        body = {}
+    auth = str(headers.get("authorization") or "")
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return str(headers.get("x-game-jobs-token") or qs.get("token") or body.get("token") or "")
+
+
+def _is_game_jobs_event(event: dict) -> bool:
+    path = str(event.get("path") or event.get("url") or "")
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except Exception:
+        body = {}
+    return path.endswith("/game-jobs") or body.get("job") == "game_events"
+
+
 async def _process_event(event: dict):
     await on_startup()
-    try:
+    if _is_game_jobs_event(event):
+        if not config.game_jobs_token or _job_token_from_event(event) != config.game_jobs_token:
+            return {"statusCode": 403, "body": json.dumps({"ok": False, "error": "forbidden"})}
+        from bot.handlers.games import process_due_game_events
+
+        processed = await process_due_game_events(bot)
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True, "processed": processed}),
+            "headers": {"Content-Type": "application/json"},
+        }
+    else:
         body = json.loads(event.get("body", "{}"))
         update = Update.model_validate(body, context={"bot": bot})
         await dp.feed_update(bot, update)
-    finally:
-        await on_shutdown()
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"ok": True}),
+            "headers": {"Content-Type": "application/json"},
+        }
 
 
 def handler(event, context):
     """Entry point for Yandex Cloud Functions."""
-    asyncio.get_event_loop().run_until_complete(_process_event(event))
-    return {
-        "statusCode": 200,
-        "body": json.dumps({"ok": True}),
-        "headers": {"Content-Type": "application/json"},
-    }
+    return asyncio.get_event_loop().run_until_complete(_process_event(event))
 
 
 # ── Local polling for development ───────────────────────────────

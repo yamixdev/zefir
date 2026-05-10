@@ -14,6 +14,38 @@ PET_ACTIONS = {
     "heal": {"label": "позаботиться", "hunger": -2, "thirst": -2, "cleanliness": 2, "mood": 2, "energy": -2, "health": 16, "affection": 4, "xp": 10, "zefirki": 2},
 }
 
+PET_EVENTS = {
+    "feed": [
+        {"text": "Питомец аккуратно спрятал кусочек на потом. Выглядит довольным.", "mood": 3, "affection": 2, "xp": 4},
+        {"text": "После перекуса питомец оживился и сам попросил маленькую тренировку.", "energy": -2, "mood": 4, "xp": 7, "zefirki": 1},
+    ],
+    "drink": [
+        {"text": "Питомец устроил короткий забег до миски и обратно.", "thirst": 3, "energy": -2, "mood": 3, "xp": 5},
+        {"text": "Вода явно пошла на пользу: питомец стал бодрее.", "health": 2, "energy": 3, "xp": 3},
+    ],
+    "wash": [
+        {"text": "После ухода питомец нашёл удобное место и с важным видом позировал.", "cleanliness": 5, "mood": 3, "xp": 5},
+        {"text": "Получилась маленькая уборочная миссия: питомец помог не разбросать вещи.", "cleanliness": 4, "affection": 2, "zefirki": 2, "xp": 4},
+    ],
+    "pet": [
+        {"text": "Питомец устроился рядом и спокойно провёл с тобой пару минут.", "mood": 4, "affection": 4, "xp": 4},
+        {"text": "Питомец заметно расслабился и стал больше доверять тебе.", "mood": 3, "affection": 5, "xp": 5},
+    ],
+    "play": [
+        {"text": "Началась мини-игра: питомец ловко поймал игрушку на последней попытке.", "energy": -4, "mood": 5, "affection": 2, "xp": 9, "zefirki": 2},
+        {"text": "Питомец сам придумал испытание на реакцию и справился лучше обычного.", "energy": -5, "mood": 4, "xp": 10, "zefirki": 3},
+        {"text": "Игра перешла в короткую охоту за спрятанной ленточкой.", "energy": -3, "mood": 4, "cleanliness": -1, "xp": 8},
+    ],
+    "sleep": [
+        {"text": "Сон получился спокойным, питомец проснулся мягче и бодрее.", "energy": 8, "health": 2, "mood": 3, "xp": 4},
+        {"text": "Питомец быстро уснул и восстановил силы лучше обычного.", "energy": 10, "health": 1, "xp": 3},
+    ],
+    "heal": [
+        {"text": "Забота сработала: питомец стал увереннее и спокойнее.", "health": 5, "mood": 3, "affection": 2, "xp": 5},
+        {"text": "Питомец выдержал процедуру терпеливо и получил дополнительный опыт.", "health": 3, "affection": 3, "xp": 8},
+    ],
+}
+
 SPECIES = {
     "cat": {"name": "Котик", "emoji": "🐱"},
     "dog": {"name": "Пёсель", "emoji": "🐶"},
@@ -148,7 +180,62 @@ async def _reaction(conn, species: str, action: str, pet: dict) -> str:
     row = await cur.fetchone()
     if row:
         return row["text"]
-    return "Питомец внимательно смотрит на тебя и явно ждёт продолжения."
+    return "Питомец спокойно реагирует и остаётся рядом."
+
+
+async def _maybe_pet_event(conn, user_id: int, action: str, pet: dict) -> tuple[dict, dict | None]:
+    events = PET_EVENTS.get(action) or []
+    if not events or _rng.randint(1, 100) > 24:
+        return pet, None
+
+    event = dict(_rng.choice(events))
+    new_xp = pet["xp"] + int(event.get("xp") or 0)
+    new_level = _level_for_xp(new_xp)
+    cur = await conn.execute(
+        """
+        UPDATE pets
+           SET xp = %s,
+               level = %s,
+               hunger = %s,
+               thirst = %s,
+               cleanliness = %s,
+               mood = %s,
+               energy = %s,
+               health = %s,
+               affection = %s,
+               updated_at = NOW()
+         WHERE id = %s
+         RETURNING *
+        """,
+        (
+            new_xp,
+            new_level,
+            _cap(pet["hunger"] + int(event.get("hunger") or 0)),
+            _cap(pet["thirst"] + int(event.get("thirst") or 0)),
+            _cap(pet["cleanliness"] + int(event.get("cleanliness") or 0)),
+            _cap(pet["mood"] + int(event.get("mood") or 0)),
+            _cap(pet["energy"] + int(event.get("energy") or 0)),
+            _cap(pet["health"] + int(event.get("health") or 0)),
+            _cap(pet["affection"] + int(event.get("affection") or 0)),
+            pet["id"],
+        ),
+    )
+    updated = await cur.fetchone()
+
+    zefirki = int(event.get("zefirki") or 0)
+    if zefirki > 0:
+        await conn.execute(
+            "UPDATE users SET zefirki = zefirki + %s WHERE user_id = %s",
+            (zefirki, user_id),
+        )
+        await conn.execute(
+            "INSERT INTO transactions (user_id, amount, reason) VALUES (%s, %s, %s)",
+            (user_id, zefirki, "pet_event"),
+        )
+        await _log_event(conn, user_id, zefirki, "pet_event", meta={"action": action})
+
+    event["level_up"] = new_level > pet["level"]
+    return updated, event
 
 
 @with_db_retry
@@ -264,6 +351,8 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
                 ),
             )
             updated = await cur.fetchone()
+            base_level_up = new_level > pet["level"]
+            updated, event = await _maybe_pet_event(conn, user_id, action, updated)
             reaction = await _reaction(conn, updated["species"], action, updated)
 
             reward = cfg["zefirki"]
@@ -311,5 +400,6 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
                 "zefirki": reward,
                 "item": item,
                 "reaction": reaction,
-                "level_up": new_level > pet["level"],
+                "event": event,
+                "level_up": base_level_up or bool(event and event.get("level_up")),
             }

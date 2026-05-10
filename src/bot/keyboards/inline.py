@@ -7,6 +7,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def main_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="📨 Связаться с владельцем", callback_data="menu:contact"))
+    kb.row(InlineKeyboardButton(text="📰 Новости", callback_data="news:home"))
     kb.row(InlineKeyboardButton(text="🎮 Развлечения и утилиты", callback_data="menu:fun"))
     return kb.as_markup()
 
@@ -23,44 +24,51 @@ def contact_submenu() -> InlineKeyboardMarkup:
 def fun_submenu() -> InlineKeyboardMarkup:
     """Подменю «Развлечения и утилиты». Порядок от самого важного."""
     kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🎮 Игры", callback_data="games:home"))
     kb.row(
-        InlineKeyboardButton(text="🎮 Игры", callback_data="games:home"),
         InlineKeyboardButton(text="🐾 Питомцы", callback_data="pet:home"),
-    )
-    kb.row(
         InlineKeyboardButton(text="🛒 Магазин", callback_data="shop:home"),
+    )
+    kb.row(
         InlineKeyboardButton(text="🏪 Рынок", callback_data="econ:market"),
-    )
-    kb.row(
         InlineKeyboardButton(text="🎒 Инвентарь", callback_data="econ:inv"),
+    )
+    kb.row(
         InlineKeyboardButton(text="👤 Профиль", callback_data="profile:me"),
-    )
-    kb.row(
-        InlineKeyboardButton(text="⛅ Погода", callback_data="weather:ask"),
-        InlineKeyboardButton(text="💱 Конвертер", callback_data="conv:start"),
-    )
-    kb.row(
-        InlineKeyboardButton(text="🐱 Зефир (AI)", callback_data="ai:start"),
-        InlineKeyboardButton(text="🔳 QR-код", callback_data="qr:start"),
+        InlineKeyboardButton(text="⚙️ Утилиты", callback_data="menu:utils"),
     )
     kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
     return kb.as_markup()
 
 
-def fun_consent_menu() -> InlineKeyboardMarkup:
+def utilities_submenu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="🐱 Зефир (AI)", callback_data="ai:start"),
+        InlineKeyboardButton(text="⛅ Погода", callback_data="weather:ask"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="💱 Конвертер", callback_data="conv:start"),
+        InlineKeyboardButton(text="🔳 QR-код", callback_data="qr:start"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun"))
+    return kb.as_markup()
+
+
+def fun_consent_menu(target: str = "fun") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📜 Правила", callback_data="funconsent:tos")],
-        [InlineKeyboardButton(text="🔒 Данные", callback_data="funconsent:privacy")],
+        [InlineKeyboardButton(text="📜 Правила", callback_data=f"funconsent:tos:{target}")],
+        [InlineKeyboardButton(text="🔒 Данные", callback_data=f"funconsent:privacy:{target}")],
         [
-            InlineKeyboardButton(text="✅ Принимаю", callback_data="funconsent:accept"),
+            InlineKeyboardButton(text="✅ Принимаю", callback_data=f"funconsent:accept:{target}"),
             InlineKeyboardButton(text="❌ Отказаться", callback_data="funconsent:decline"),
         ],
     ])
 
 
-def fun_consent_back() -> InlineKeyboardMarkup:
+def fun_consent_back(target: str = "fun") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ К выбору", callback_data="funconsent:show")],
+        [InlineKeyboardButton(text="⬅️ К выбору", callback_data=f"funconsent:show:{target}")],
     ])
 
 
@@ -216,6 +224,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast"),
         InlineKeyboardButton(text="👑 Мой профиль", callback_data="profile:admin"),
     )
+    kb.row(InlineKeyboardButton(text="📰 Новости", callback_data="adm:news"))
     kb.row(InlineKeyboardButton(text="🍬 Экономика", callback_data="adm:econ"))
     kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
     return kb.as_markup()

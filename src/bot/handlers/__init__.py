@@ -13,11 +13,13 @@ from .pet import router as pet_router
 from .games import router as games_router
 from .shop import router as shop_router
 from .admin_economy import router as admin_economy_router
+from .news import router as news_router
 
 
 def setup_routers() -> Router:
     root = Router()
     root.include_router(start_router)
+    root.include_router(news_router)
     root.include_router(admin_router)
     root.include_router(admin_economy_router)
     root.include_router(profile_router)

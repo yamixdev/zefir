@@ -28,11 +28,19 @@ class RateLimitMiddleware(BaseMiddleware):
         if config.is_admin(user_id):
             return await handler(event, data)
 
+        fsm = data.get("state")
+        if fsm and await fsm.get_state():
+            return await handler(event, data)
+
         now = time.time()
         last = _last_message.get(user_id, 0)
 
         if now - last < config.message_cooldown_sec:
-            return  # silently drop
+            try:
+                await event.answer("Слишком быстро. Подожди пару секунд и повтори.")
+            except Exception:
+                pass
+            return
 
         _last_message[user_id] = now
         return await handler(event, data)

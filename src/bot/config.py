@@ -22,6 +22,16 @@ class Config:
     market_commission_percent: int = int(os.getenv("MARKET_COMMISSION_PERCENT", "25"))
     game_daily_win_limit: int = int(os.getenv("GAME_DAILY_WIN_LIMIT", "300"))
     ttt_turn_timeout_minutes: int = int(os.getenv("TTT_TURN_TIMEOUT_MINUTES", "15"))
+    game_session_timeout_minutes: int = int(os.getenv("GAME_SESSION_TIMEOUT_MINUTES", "30"))
+    ranked_season_days: int = int(os.getenv("RANKED_SEASON_DAYS", "14"))
+    ranked_start_elo: int = int(os.getenv("RANKED_START_ELO", "1000"))
+    ranked_k_factor: int = int(os.getenv("RANKED_K_FACTOR", "32"))
+    ranked_min_reward_games: int = int(os.getenv("RANKED_MIN_REWARD_GAMES", "3"))
+    max_game_stake: int = int(os.getenv("MAX_GAME_STAKE", "100"))
+    bot_release_version: str = os.getenv("BOT_RELEASE_VERSION", "2026-05-09")
+    news_notification_hours: int = int(os.getenv("NEWS_NOTIFICATION_HOURS", "8"))
+    quiz_ai_enabled: bool = os.getenv("QUIZ_AI_ENABLED", "1") != "0"
+    game_jobs_token: str = os.getenv("GAME_JOBS_TOKEN", "")
 
     def __post_init__(self):
         raw = os.getenv("ADMINS", "")

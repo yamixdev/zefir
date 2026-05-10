@@ -5,6 +5,7 @@ from bot.services.economy_service import (
     create_listing,
     grant_item,
     open_case,
+    set_item_active,
 )
 
 from conftest import create_user, fetch_one, fetch_value
@@ -60,4 +61,30 @@ async def test_market_listing_buy_cancel_commission_and_double_buy(conn):
         "SELECT quantity FROM user_inventory WHERE user_id = %s AND item_id = %s",
         (seller_id, item["id"]),
     )
+    assert seller_items == 1
+
+
+async def test_market_disabled_item_listing_is_cancelled_and_not_buyable(conn):
+    seller_id = 211
+    buyer_id = 212
+    await create_user(conn, seller_id, zefirki=0)
+    await create_user(conn, buyer_id, zefirki=500)
+    item = await fetch_one(conn, "SELECT id FROM items WHERE code = 'ribbon'")
+    assert await grant_item(seller_id, item["id"], 1, reason="test") is True
+
+    listed = await create_listing(seller_id, item["id"], 100)
+    assert listed["ok"] is True
+    assert await set_item_active(item["id"], False) is True
+
+    bought = await buy_listing(buyer_id, listed["listing"]["id"])
+    seller_items = await fetch_value(
+        conn,
+        "SELECT quantity FROM user_inventory WHERE user_id = %s AND item_id = %s",
+        (seller_id, item["id"]),
+    )
+    listing_status = await fetch_value(conn, "SELECT status FROM market_listings WHERE id = %s", (listed["listing"]["id"],))
+
+    assert bought["ok"] is False
+    assert bought["error"] == "not_available"
+    assert listing_status == "cancelled"
     assert seller_items == 1

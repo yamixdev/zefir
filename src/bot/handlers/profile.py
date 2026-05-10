@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 from aiogram import Router, F
@@ -17,6 +18,7 @@ from bot.models import (
 )
 from bot.services.economy_service import get_my_listings
 from bot.services.games_service import list_user_active_games
+from bot.services.game_session_service import list_my_sessions
 from bot.services.pet_service import get_pet, SPECIES
 
 
@@ -140,13 +142,16 @@ async def cb_profile_me(callback: CallbackQuery):
         await callback.answer("Профиль не найден", show_alert=True)
         return
 
-    ai_info = await get_ai_limit_info(user_id)
-    tstats = await get_user_ticket_stats(user_id)
-    zefirki = await get_zefirki_balance(user_id)
-    pet = await get_pet(user_id)
-    daily_available = await _daily_available(user_id)
-    active_games = await list_user_active_games(user_id)
-    active_listings = await get_my_listings(user_id)
+    ai_info, tstats, zefirki, pet, daily_available, active_games, active_sessions, active_listings = await asyncio.gather(
+        get_ai_limit_info(user_id),
+        get_user_ticket_stats(user_id),
+        get_zefirki_balance(user_id),
+        get_pet(user_id),
+        _daily_available(user_id),
+        list_user_active_games(user_id),
+        list_my_sessions(user_id),
+        get_my_listings(user_id),
+    )
 
     text = _user_profile_text(
         user,
@@ -155,7 +160,7 @@ async def cb_profile_me(callback: CallbackQuery):
         zefirki,
         pet,
         daily_available,
-        len(active_games["pve"]) + len(active_games["rooms"]),
+        len(active_games["pve"]) + len(active_games["rooms"]) + len(active_sessions),
         len(active_listings),
     )
     try:

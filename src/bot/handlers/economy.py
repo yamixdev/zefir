@@ -1,3 +1,4 @@
+import asyncio
 import html
 
 from aiogram import Bot, F, Router
@@ -16,6 +17,7 @@ from bot.services.economy_service import (
     buy_listing,
     cancel_listing,
     create_listing,
+    get_case_rewards,
     get_inventory,
     get_inventory_item,
     get_market_listing,
@@ -40,7 +42,15 @@ def _money(n: int) -> str:
     return f"{n:,}".replace(",", " ")
 
 
-def _inventory_kb(items: list[dict]) -> InlineKeyboardMarkup:
+PAGE_SIZE = 6
+
+
+def _page_items(items: list[dict], page: int) -> list[dict]:
+    start = max(0, page) * PAGE_SIZE
+    return items[start:start + PAGE_SIZE]
+
+
+def _inventory_kb(items: list[dict], category: str | None = None, page: int = 0) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(text="Всё", callback_data="econ:inv"),
@@ -52,11 +62,18 @@ def _inventory_kb(items: list[dict]) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Одежда", callback_data="econ:inv:c:clothes"),
         InlineKeyboardButton(text="Редкое", callback_data="econ:inv:c:rare"),
     )
-    for item in items[:20]:
+    for item in _page_items(items, page):
         kb.row(InlineKeyboardButton(
             text=f"{item_label(item)} x{item['quantity']}",
             callback_data=f"econ:item:{item['id']}",
         ))
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"econ:inv:p:{category or 'all'}:{page - 1}"))
+    if len(items) > (page + 1) * PAGE_SIZE:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"econ:inv:p:{category or 'all'}:{page + 1}"))
+    if nav:
+        kb.row(*nav)
     kb.row(InlineKeyboardButton(text="🏪 Рынок", callback_data="econ:market"))
     kb.row(InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun"))
     return kb.as_markup()
@@ -88,31 +105,55 @@ def _cases_kb(cases: list[dict]) -> InlineKeyboardMarkup:
 
 def _case_detail_kb(case_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔓 Открыть кейс", callback_data=f"econ:open:{case_id}")],
+        [InlineKeyboardButton(text="🔓 Крутить", callback_data=f"econ:open:{case_id}")],
         [InlineKeyboardButton(text="📦 Все кейсы", callback_data="econ:cases")],
         [InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun")],
     ])
 
 
-def _market_kb(listings: list[dict], rarity: str | None = None) -> InlineKeyboardMarkup:
+def _case_open_kb(case_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Крутить ещё", callback_data=f"econ:open:{case_id}")],
+        [InlineKeyboardButton(text="✅ Хватит", callback_data="econ:cases")],
+        [InlineKeyboardButton(text="🎒 Инвентарь", callback_data="econ:inv")],
+    ])
+
+
+def _market_kb(listings: list[dict], rarity: str | None = None, category: str | None = None, page: int = 0) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="Еда", callback_data="econ:market:c:food"),
-        InlineKeyboardButton(text="Одежда", callback_data="econ:market:c:clothes"),
-        InlineKeyboardButton(text="Редкое", callback_data="econ:market:c:rare"),
-    )
+    kb.row(InlineKeyboardButton(text="🔎 Фильтры", callback_data="econ:market:filters"))
     for listing in listings:
         icon = RARITY_ICONS.get(listing["rarity"], "▫️")
         kb.row(InlineKeyboardButton(
             text=f"{icon} {listing['name']} — {_money(listing['price'])} 🍬",
             callback_data=f"econ:listing:{listing['id']}",
         ))
+    nav = []
+    key = f"r_{rarity}" if rarity else (f"c_{category}" if category else "all")
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"econ:market:p:{key}:{page - 1}"))
+    if len(listings) >= PAGE_SIZE:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"econ:market:p:{key}:{page + 1}"))
+    if nav:
+        kb.row(*nav)
+    kb.row(
+        InlineKeyboardButton(text="Мои лоты", callback_data="econ:mylist"),
+        InlineKeyboardButton(text="🎒 Инвентарь", callback_data="econ:inv"),
+    )
+    return kb.as_markup()
+
+
+def _market_filters_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="Еда", callback_data="econ:market:c:food"),
+        InlineKeyboardButton(text="Одежда", callback_data="econ:market:c:clothes"),
+        InlineKeyboardButton(text="Редкое", callback_data="econ:market:c:rare"),
+    )
     kb.row(
         InlineKeyboardButton(text="Все", callback_data="econ:market"),
         InlineKeyboardButton(text="Редкие+", callback_data="econ:market:r:rare_plus"),
     )
-    kb.row(InlineKeyboardButton(text="Мои лоты", callback_data="econ:mylist"))
-    kb.row(InlineKeyboardButton(text="🎒 Инвентарь", callback_data="econ:inv"))
     return kb.as_markup()
 
 
@@ -128,10 +169,15 @@ def _my_listings_kb(listings: list[dict]) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-@router.callback_query(F.data.regexp(r"^econ:inv(:c:\w+)?$"))
+@router.callback_query(F.data.regexp(r"^econ:inv(:c:\w+)?$|^econ:inv:p:\w+:\d+$"))
 async def cb_inventory(callback: CallbackQuery):
     parts = callback.data.split(":")
-    category = parts[3] if len(parts) == 4 else None
+    page = 0
+    if len(parts) == 5 and parts[2] == "p":
+        category = None if parts[3] == "all" else parts[3]
+        page = int(parts[4])
+    else:
+        category = parts[3] if len(parts) == 4 else None
     items = await get_inventory(callback.from_user.id, category=category)
     title = CATEGORY_LABELS.get(category or "all", "всё")
     if not items:
@@ -142,11 +188,13 @@ async def cb_inventory(callback: CallbackQuery):
         )
     else:
         lines = [f"🎒 <b>Инвентарь</b> · {title}\n"]
-        for item in items[:20]:
+        for item in _page_items(items, page):
             rarity = RARITY_LABELS.get(item["rarity"], item["rarity"])
             lines.append(f"{item_label(item)} x<b>{item['quantity']}</b> · <i>{rarity}</i>")
+        if len(items) > PAGE_SIZE:
+            lines.append(f"\nСтраница <b>{page + 1}</b>")
         text = "\n".join(lines)
-    await smart_edit(callback, text, reply_markup=_inventory_kb(items))
+    await smart_edit(callback, text, reply_markup=_inventory_kb(items, category, page))
     await callback.answer()
 
 
@@ -333,10 +381,22 @@ async def cb_case_detail(callback: CallbackQuery):
     if not case:
         await callback.answer("Кейс недоступен", show_alert=True)
         return
+    rewards = await get_case_rewards(case_id)
+    if rewards:
+        loot_lines = ["\n<b>Внутри:</b>"]
+        for reward in rewards:
+            loot_lines.append(
+                f"{item_label(reward)} · <i>{RARITY_LABELS.get(reward['rarity'], reward['rarity'])}</i> · "
+                f"{reward['chance']:.1f}%"
+            )
+        loot_text = "\n".join(loot_lines)
+    else:
+        loot_text = "\n<b>Внутри:</b>\nПока нет активного лута."
     text = (
         f"📦 <b>{html.escape(case['name'])}</b>\n\n"
         f"{html.escape(case['description'] or '')}\n\n"
         f"Цена: <b>{_money(case['price'])}</b> 🍬"
+        f"{loot_text}"
     )
     await smart_edit(callback, text, reply_markup=_case_detail_kb(case_id))
     await callback.answer()
@@ -357,26 +417,49 @@ async def cb_open_case(callback: CallbackQuery):
         return
     item = result["item"]
     case = result["case"]
+    for frame in ("📦 Кейс дрожит...", "✨ Лента крутится...", "🎁 Почти выпало..."):
+        try:
+            await smart_edit(callback, f"<b>{frame}</b>")
+            await asyncio.sleep(0.35)
+        except Exception:
+            break
     text = (
         f"📦 <b>{html.escape(case['name'])}</b> открыт!\n\n"
         f"Выпало: {item_label(item)}\n"
         f"Редкость: <b>{RARITY_LABELS.get(item['rarity'], item['rarity'])}</b>\n\n"
         f"Баланс: <b>{_money(result['balance'])}</b> 🍬"
     )
-    await smart_edit(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔁 Открыть ещё", callback_data=f"econ:open:{case_id}")],
-        [InlineKeyboardButton(text="🎒 Инвентарь", callback_data="econ:inv")],
-        [InlineKeyboardButton(text="📦 Кейсы", callback_data="econ:cases")],
-    ]))
+    await smart_edit(callback, text, reply_markup=_case_open_kb(case_id))
     await callback.answer("Предмет добавлен в инвентарь")
 
 
-@router.callback_query(F.data.regexp(r"^econ:market((:r|:c):\w+)?$"))
+@router.callback_query(F.data == "econ:market:filters")
+async def cb_market_filters(callback: CallbackQuery):
+    await smart_edit(
+        callback,
+        "🔎 <b>Фильтры рынка</b>\n\nВыбери категорию или редкость.",
+        reply_markup=_market_filters_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^econ:market((:r|:c):\w+)?$|^econ:market:p:(all|[rc]_\w+):\d+$"))
 async def cb_market(callback: CallbackQuery):
     parts = callback.data.split(":")
-    rarity = parts[3] if len(parts) == 4 and parts[2] == "r" else None
-    category = parts[3] if len(parts) == 4 and parts[2] == "c" else None
-    listings = await list_market(rarity=rarity, category=category, limit=10)
+    rarity = None
+    category = None
+    page = 0
+    if len(parts) == 5 and parts[2] == "p":
+        key = parts[3]
+        if key.startswith("r_"):
+            rarity = key[2:]
+        elif key.startswith("c_"):
+            category = key[2:]
+        page = int(parts[-1])
+    elif len(parts) == 4:
+        rarity = parts[3] if parts[2] == "r" else None
+        category = parts[3] if parts[2] == "c" else None
+    listings = await list_market(rarity=rarity, category=category, limit=PAGE_SIZE, offset=page * PAGE_SIZE)
     if not listings:
         text = "🏪 <b>Рынок</b>\n\nАктивных лотов пока нет."
     else:
@@ -388,7 +471,9 @@ async def cb_market(callback: CallbackQuery):
                 f"<b>{html.escape(listing['name'])}</b> — <b>{_money(listing['price'])}</b> 🍬 · {html.escape(seller)}"
             )
         text = "\n".join(lines)
-    await smart_edit(callback, text, reply_markup=_market_kb(listings, rarity))
+    if page:
+        text += f"\n\nСтраница <b>{page + 1}</b>"
+    await smart_edit(callback, text, reply_markup=_market_kb(listings, rarity, category, page))
     await callback.answer()
 
 
@@ -408,10 +493,18 @@ async def cb_listing_detail(callback: CallbackQuery):
         f"Цена: <b>{_money(listing['price'])}</b> 🍬\n\n"
         f"<i>{html.escape(listing.get('description') or '')}</i>"
     )
-    await smart_edit(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Купить", callback_data=f"econ:buy:{listing_id}")],
-        [InlineKeyboardButton(text="⬅️ Рынок", callback_data="econ:market")],
-    ]))
+    if listing["seller_id"] == callback.from_user.id:
+        text += "\n\n<i>Это твой лот. Купить его нельзя, можно только снять с рынка.</i>"
+        rows = [
+            [InlineKeyboardButton(text="❌ Снять лот", callback_data=f"econ:cancel:{listing_id}")],
+            [InlineKeyboardButton(text="⬅️ Рынок", callback_data="econ:market")],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton(text="✅ Купить", callback_data=f"econ:buy:{listing_id}")],
+            [InlineKeyboardButton(text="⬅️ Рынок", callback_data="econ:market")],
+        ]
+    await smart_edit(callback, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 
@@ -440,6 +533,7 @@ async def cb_buy_listing(callback: CallbackQuery):
     if not result["ok"]:
         errors = {
             "not_available": "Лот уже недоступен.",
+            "item_disabled": "Предмет отключён владельцем, лот больше нельзя купить.",
             "own_listing": "Свой лот купить нельзя.",
             "not_enough": f"Не хватает зефирок. Баланс: {_money(result.get('balance', 0))}",
         }
