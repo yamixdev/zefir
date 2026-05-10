@@ -105,26 +105,57 @@ async def on_shutdown():
 
 
 # ── Yandex Cloud Functions handler ──────────────────────────────
+def _timer_payload_from_event(event: dict) -> dict:
+    try:
+        messages = event.get("messages") or []
+        payload = ((messages[0] or {}).get("details") or {}).get("payload")
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str) and payload.strip():
+        try:
+            return json.loads(payload)
+        except Exception:
+            return {}
+    return {}
+
+
+def _body_payload_from_event(event: dict) -> dict:
+    body_raw = event.get("body") or "{}"
+    try:
+        body = json.loads(body_raw)
+    except Exception:
+        body = {}
+    return body if isinstance(body, dict) else {}
+
+
 def _job_token_from_event(event: dict) -> str:
     headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
     qs = event.get("queryStringParameters") or {}
-    try:
-        body = json.loads(event.get("body") or "{}")
-    except Exception:
-        body = {}
+    body = _body_payload_from_event(event)
+    timer_payload = _timer_payload_from_event(event)
     auth = str(headers.get("authorization") or "")
     if auth.lower().startswith("bearer "):
         return auth.split(" ", 1)[1].strip()
-    return str(headers.get("x-game-jobs-token") or qs.get("token") or body.get("token") or "")
+    return str(
+        headers.get("x-game-jobs-token")
+        or qs.get("token")
+        or body.get("token")
+        or timer_payload.get("token")
+        or ""
+    )
 
 
 def _is_game_jobs_event(event: dict) -> bool:
     path = str(event.get("path") or event.get("url") or "")
-    try:
-        body = json.loads(event.get("body") or "{}")
-    except Exception:
-        body = {}
-    return path.endswith("/game-jobs") or body.get("job") == "game_events"
+    body = _body_payload_from_event(event)
+    timer_payload = _timer_payload_from_event(event)
+    return (
+        path.endswith("/game-jobs")
+        or body.get("job") == "game_events"
+        or timer_payload.get("job") == "game_events"
+    )
 
 
 async def _process_event(event: dict):
