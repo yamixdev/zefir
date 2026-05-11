@@ -24,6 +24,7 @@ from bot.services.news_service import (
     publish_news,
     set_news_mode,
 )
+from bot.services.time_service import format_msk
 from bot.utils import render_clean_message, smart_edit
 
 router = Router()
@@ -92,14 +93,14 @@ def _news_home_text(posts: list[dict], mode: str) -> str:
     lines.append("Последнее:")
     for post in posts[:5]:
         published = post.get("published_at")
-        date = published.strftime("%d.%m") if published else "без даты"
+        date = format_msk(published, "%d.%m") if published else "без даты"
         lines.append(f"• <b>{html.escape(post['title'])}</b> · {_kind_label(post['kind'])} · {date}")
     return "\n".join(lines)
 
 
 def _news_detail_text(post: dict) -> str:
     published = post.get("published_at")
-    date = published.strftime("%d.%m.%Y %H:%M") if published else "черновик"
+    date = f"{format_msk(published)} МСК" if published else "черновик"
     version = f"\nВерсия: <code>{html.escape(post['release_version'])}</code>" if post.get("release_version") else ""
     return (
         f"📰 <b>{html.escape(post['title'])}</b>\n"

@@ -1,12 +1,14 @@
 import asyncio
+import html
 import json
 import logging
 import sys
+import traceback
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat, Update
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat, ErrorEvent, Update
 
 from bot.config import config
 from bot.db import init_db, close_db
@@ -16,6 +18,7 @@ from bot.middlewares.user_register import UserRegisterMiddleware
 from bot.middlewares.rate_limit import RateLimitMiddleware
 from bot.middlewares.fun_consent import FunConsentMiddleware
 from bot.middlewares.news_notice import NewsNoticeMiddleware
+from bot.services.time_service import today_msk, now_msk
 
 PUBLIC_COMMANDS = [
     BotCommand(command="start",   description="🏠 Главное меню"),
@@ -65,6 +68,66 @@ dp.callback_query.outer_middleware(FunConsentMiddleware())
 dp.message.outer_middleware(RateLimitMiddleware())
 
 
+def _error_context(update: Update) -> tuple[int | None, int | None, str | None]:
+    message = update.message or update.edited_message
+    if message and message.from_user:
+        text = (message.text or message.caption or "").strip()
+        action = text.split(maxsplit=1)[0] if text.startswith("/") else "message"
+        return message.from_user.id, message.chat.id, action
+    callback = update.callback_query
+    if callback and callback.from_user:
+        chat_id = callback.message.chat.id if callback.message else callback.from_user.id
+        return callback.from_user.id, chat_id, callback.data or "callback"
+    return None, None, None
+
+
+async def on_error(event: ErrorEvent, bot: Bot):
+    tb = "".join(traceback.format_exception(type(event.exception), event.exception, event.exception.__traceback__))
+    user_id, chat_id, action = _error_context(event.update)
+    logger.error(
+        "🚨 Ошибка в обработке update user=%s action=%s",
+        user_id,
+        action,
+        exc_info=(type(event.exception), event.exception, event.exception.__traceback__),
+    )
+    from bot.keyboards.inline import admin_incident_actions
+    from bot.models import create_incident
+
+    incident_id = await create_incident(
+        title=event.exception.__class__.__name__,
+        message=str(event.exception),
+        traceback_text=tb[-5000:],
+        user_id=user_id,
+        chat_id=chat_id,
+        action=action,
+        event_type="auto",
+    )
+    if chat_id:
+        try:
+            await bot.send_message(
+                chat_id,
+                f"⚠️ Произошла ошибка. Инцидент #{incident_id} передан владельцу, я постараюсь не потерять контекст.",
+            )
+        except Exception:
+            pass
+    admin_text = (
+        f"🚨 <b>Инцидент #{incident_id}</b>\n\n"
+        f"Ошибка: <b>{event.exception.__class__.__name__}</b>\n"
+        f"Пользователь: <code>{user_id or '—'}</code>\n"
+        f"Действие: <code>{html.escape(action or '—')}</code>\n\n"
+        "Подробности в логах хостинга и карточке инцидента."
+    )
+    for admin_id in config.admins:
+        try:
+            await bot.send_message(admin_id, admin_text, reply_markup=admin_incident_actions(incident_id))
+        except Exception:
+            pass
+    return True
+
+
+dp.errors.register(on_error)
+
+
 _commands_set = False
 _started = False
 
@@ -93,7 +156,7 @@ async def on_startup():
     await init_db()
     await _setup_commands()
     _started = True
-    logger.info("🍬 Зефирка запущена, БД подключена")
+    logger.info("🍬 Зефирка запущена, БД подключена; app_date_msk=%s now_msk=%s", today_msk(), now_msk().strftime("%d.%m.%Y %H:%M"))
 
 
 async def on_shutdown():
@@ -166,6 +229,7 @@ async def _process_event(event: dict):
         from bot.handlers.games import process_due_game_events
 
         processed = await process_due_game_events(bot)
+        logger.info("🎮 Game jobs обработаны: date_msk=%s processed=%s", today_msk(), processed)
         return {
             "statusCode": 200,
             "body": json.dumps({"ok": True, "processed": processed}),

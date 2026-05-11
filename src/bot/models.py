@@ -7,6 +7,8 @@
 """
 from datetime import datetime, timedelta, timezone
 
+from psycopg.types.json import Jsonb
+
 from bot.config import config
 from bot.db import get_pool, with_db_retry
 
@@ -58,10 +60,206 @@ async def is_banned(user_id: int) -> bool:
 
 
 @with_db_retry
-async def set_ban(user_id: int, banned: bool):
+async def set_ban(
+    user_id: int,
+    banned: bool,
+    reason_code: str | None = None,
+    reason_text: str | None = None,
+    banned_by: int | None = None,
+):
     pool = await get_pool()
     async with pool.connection() as conn:
-        await conn.execute("UPDATE users SET is_banned = %s WHERE user_id = %s", (banned, user_id))
+        if banned:
+            await conn.execute(
+                """
+                UPDATE users
+                   SET is_banned = TRUE,
+                       ban_reason_code = %s,
+                       ban_reason_text = %s,
+                       banned_by = %s,
+                       banned_at = NOW()
+                 WHERE user_id = %s
+                """,
+                (reason_code, reason_text, banned_by, user_id),
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE users
+                   SET is_banned = FALSE,
+                       ban_reason_code = NULL,
+                       ban_reason_text = NULL,
+                       banned_by = NULL,
+                       banned_at = NULL
+                 WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+
+
+@with_db_retry
+async def record_user_activity(
+    user_id: int,
+    event_type: str,
+    action: str,
+    chat_id: int | None = None,
+    context: dict | None = None,
+) -> None:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                UPDATE users
+                   SET last_active_at = NOW(),
+                       last_action = %s,
+                       last_chat_id = %s
+                 WHERE user_id = %s
+                """,
+                (action[:255], chat_id, user_id),
+            )
+            await conn.execute(
+                """
+                INSERT INTO user_activity_events (user_id, event_type, action, chat_id, context)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (user_id, event_type[:50], action[:255], chat_id, Jsonb(context or {})),
+            )
+
+
+@with_db_retry
+async def get_online_users(minutes: int = 15, limit: int = 30) -> list[dict]:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT user_id, username, first_name, last_name, is_banned,
+                   last_active_at, last_action, last_chat_id, bot_blocked_at
+            FROM users
+            WHERE last_active_at >= NOW() - make_interval(mins => %s)
+            ORDER BY last_active_at DESC
+            LIMIT %s
+            """,
+            (minutes, limit),
+        )
+        return await cur.fetchall()
+
+
+@with_db_retry
+async def get_user_activity(user_id: int, limit: int = 20) -> list[dict]:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT *
+            FROM user_activity_events
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        )
+        return await cur.fetchall()
+
+
+@with_db_retry
+async def mark_bot_blocked(user_id: int, blocked: bool) -> None:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE users SET bot_blocked_at = %s WHERE user_id = %s",
+            (datetime.now(timezone.utc) if blocked else None, user_id),
+        )
+
+
+@with_db_retry
+async def create_incident(
+    title: str,
+    message: str | None = None,
+    traceback_text: str | None = None,
+    user_id: int | None = None,
+    chat_id: int | None = None,
+    action: str | None = None,
+    event_type: str = "auto",
+) -> int:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            INSERT INTO bot_incidents
+                (user_id, chat_id, event_type, action, title, message, traceback_text)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (user_id, chat_id, event_type, action, title[:255], message, traceback_text),
+        )
+        row = await cur.fetchone()
+        return row["id"]
+
+
+@with_db_retry
+async def list_incidents(status: str | None = "open", limit: int = 20, offset: int = 0) -> list[dict]:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        params: list = []
+        where = ""
+        if status:
+            where = "WHERE bi.status = %s"
+            params.append(status)
+        params.extend([limit, offset])
+        cur = await conn.execute(
+            f"""
+            SELECT bi.*, u.username, u.first_name
+            FROM bot_incidents bi
+            LEFT JOIN users u ON u.user_id = bi.user_id
+            {where}
+            ORDER BY bi.created_at DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params),
+        )
+        return await cur.fetchall()
+
+
+@with_db_retry
+async def get_incident(incident_id: int) -> dict | None:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT bi.*, u.username, u.first_name
+            FROM bot_incidents bi
+            LEFT JOIN users u ON u.user_id = bi.user_id
+            WHERE bi.id = %s
+            """,
+            (incident_id,),
+        )
+        return await cur.fetchone()
+
+
+@with_db_retry
+async def close_incident(
+    incident_id: int,
+    status: str,
+    admin_note: str | None,
+    closed_by: int,
+) -> dict | None:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            UPDATE bot_incidents
+               SET status = %s,
+                   admin_note = %s,
+                   closed_by = %s,
+                   closed_at = NOW(),
+                   updated_at = NOW()
+             WHERE id = %s
+             RETURNING *
+            """,
+            (status, admin_note, closed_by, incident_id),
+        )
+        return await cur.fetchone()
 
 
 @with_db_retry

@@ -101,6 +101,23 @@ async def _grant(conn, user_id: int, amount: int, reason: str, game_id: str) -> 
     )
 
 
+async def _balance(conn, user_id: int) -> int:
+    cur = await conn.execute("SELECT zefirki FROM users WHERE user_id = %s", (user_id,))
+    row = await cur.fetchone()
+    return int(row["zefirki"]) if row else 0
+
+
+async def _settlement_row(conn, user_id: int, result: str, stake: int, payout: int) -> dict:
+    return {
+        "user_id": user_id,
+        "result": result,
+        "stake": stake,
+        "payout": payout,
+        "delta": payout - stake,
+        "balance_after": await _balance(conn, user_id),
+    }
+
+
 async def _session_players(conn, session_id: str) -> list[dict]:
     cur = await conn.execute(
         """
@@ -151,7 +168,7 @@ async def _full(conn, session: dict | None) -> dict | None:
 
 
 def _expires(minutes: int | None = None) -> datetime:
-    return datetime.now(UTC) + timedelta(minutes=minutes or config.game_session_timeout_minutes)
+    return datetime.now(UTC) + timedelta(minutes=minutes or config.stale_game_timeout_minutes)
 
 
 def _quiz_state(count: int, ranked: bool = False, questions: list[dict] | None = None) -> dict:
@@ -576,17 +593,25 @@ async def join_session(session_id: str, user) -> dict:
 
 async def expire_session(conn, session: dict) -> dict:
     players = await _session_players(conn, session["id"])
+    settlements = []
     if session["stake"] > 0 and session["status"] in ("waiting", "running"):
         for player in players:
             await _grant(conn, player["user_id"], session["stake"], "game_refund", session["id"])
+            settlements.append(await _settlement_row(conn, player["user_id"], "expired", session["stake"], session["stake"]))
+    elif session["status"] in ("waiting", "running"):
+        for player in players:
+            settlements.append(await _settlement_row(conn, player["user_id"], "expired", 0, 0))
+    state = dict(session.get("state") or {})
+    if settlements:
+        state["settlements"] = settlements
     cur = await conn.execute(
         """
         UPDATE game_sessions
-           SET status = 'expired', result = 'timeout', updated_at = NOW()
+           SET status = 'expired', result = 'timeout', state = %s, updated_at = NOW()
          WHERE id = %s
         RETURNING *
         """,
-        (session["id"],),
+        (Jsonb(state), session["id"]),
     )
     await _cancel_scheduled_events(conn, session["id"])
     return await _full(conn, await cur.fetchone())
@@ -696,14 +721,34 @@ async def finish_session(session_id: str, winner_id: int | None, result: str = "
             if session["status"] in ("finished", "draw", "cancelled", "expired"):
                 return {"ok": True, "session": await _full(conn, session)}
             players = await _session_players(conn, session_id)
+            settlements = []
             is_draw = result == "draw"
             if session["stake"] > 0:
                 if is_draw:
                     for player in players:
                         await _grant(conn, player["user_id"], session["stake"], "game_refund", session_id)
+                        settlements.append(await _settlement_row(conn, player["user_id"], "draw", session["stake"], session["stake"]))
                 elif winner_id:
-                    multiplier = 2 if session["mode"] == "bot" and session["game_type"] == "blackjack" else len(players)
-                    await _grant(conn, winner_id, session["stake"] * multiplier, "game_win", session_id)
+                    winner_payout = session["stake"] * (2 if session["mode"] == "bot" and session["game_type"] == "blackjack" else len(players))
+                    await _grant(conn, winner_id, winner_payout, "game_win", session_id)
+                    for player in players:
+                        payout = winner_payout if player["user_id"] == winner_id else 0
+                        settlements.append(await _settlement_row(
+                            conn,
+                            player["user_id"],
+                            "won" if player["user_id"] == winner_id else "lost",
+                            session["stake"],
+                            payout,
+                        ))
+            else:
+                for player in players:
+                    settlements.append(await _settlement_row(
+                        conn,
+                        player["user_id"],
+                        "draw" if is_draw else "won" if player["user_id"] == winner_id else "lost",
+                        0,
+                        0,
+                    ))
             if session["ranked"] and session["game_type"] in RANKED_TYPES:
                 if session["game_type"] == "quiz" and len(players) >= 2:
                     from bot.services.rating_service import apply_ranked_placements
@@ -723,18 +768,22 @@ async def finish_session(session_id: str, winner_id: int | None, result: str = "
                         is_draw,
                     )
             status = "draw" if is_draw else "finished"
+            state = dict(session.get("state") or {})
+            if settlements:
+                state["settlements"] = settlements
             cur = await conn.execute(
                 """
                 UPDATE game_sessions
                    SET status = %s,
                        winner_id = %s,
                        result = %s,
+                       state = %s,
                        current_turn_id = NULL,
                        updated_at = NOW()
                  WHERE id = %s
                 RETURNING *
                 """,
-                (status, winner_id, result, session_id),
+                (status, winner_id, result, Jsonb(state), session_id),
             )
             await _cancel_scheduled_events(conn, session_id)
             return {"ok": True, "session": await _full(conn, await cur.fetchone())}
@@ -750,32 +799,67 @@ async def _finish_locked(
 ) -> dict:
     session_id = session["id"]
     is_draw = result == "draw"
+    settlement_rows: list[dict] = []
     if session["stake"] > 0:
         if settlements:
+            by_user = {int(item["user_id"]): item for item in settlements}
             for settlement in settlements:
                 payout = session["stake"] * int(settlement.get("payout_multiplier") or 0)
                 if payout:
                     await _grant(conn, settlement["user_id"], payout, "game_win" if payout > session["stake"] else "game_refund", session_id)
+            for player in players:
+                item = by_user.get(player["user_id"], {})
+                payout = session["stake"] * int(item.get("payout_multiplier") or 0)
+                settlement_rows.append(await _settlement_row(
+                    conn,
+                    player["user_id"],
+                    item.get("outcome") or "lost",
+                    session["stake"],
+                    payout,
+                ))
         elif is_draw:
             for player in players:
                 await _grant(conn, player["user_id"], session["stake"], "game_refund", session_id)
+                settlement_rows.append(await _settlement_row(conn, player["user_id"], "draw", session["stake"], session["stake"]))
         elif winner_id:
             await _grant(conn, winner_id, session["stake"] * len(players), "game_win", session_id)
+            for player in players:
+                payout = session["stake"] * len(players) if player["user_id"] == winner_id else 0
+                settlement_rows.append(await _settlement_row(
+                    conn,
+                    player["user_id"],
+                    "won" if player["user_id"] == winner_id else "lost",
+                    session["stake"],
+                    payout,
+                ))
+    else:
+        for player in players:
+            settlement_rows.append(await _settlement_row(
+                conn,
+                player["user_id"],
+                "draw" if is_draw else "won" if player["user_id"] == winner_id else "lost",
+                0,
+                0,
+            ))
 
     await _cancel_scheduled_events(conn, session_id)
     status = "draw" if is_draw else "finished"
+    state = dict(session.get("state") or {})
+    if settlement_rows:
+        state["settlements"] = settlement_rows
     cur = await conn.execute(
         """
         UPDATE game_sessions
            SET status = %s,
                winner_id = %s,
                result = %s,
+               state = %s,
                current_turn_id = NULL,
                updated_at = NOW()
          WHERE id = %s
         RETURNING *
         """,
-        (status, winner_id, result, session_id),
+        (status, winner_id, result, Jsonb(state), session_id),
     )
     return await cur.fetchone()
 
@@ -1110,6 +1194,30 @@ async def activate_due_duel_signals(limit: int = 20) -> list[dict]:
 
 
 @with_db_retry
+async def expire_stale_sessions(limit: int = 50) -> list[dict]:
+    expired: list[dict] = []
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute(
+                """
+                SELECT *
+                FROM game_sessions
+                WHERE status IN ('waiting', 'running')
+                  AND expires_at <= NOW()
+                ORDER BY expires_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+                """,
+                (limit,),
+            )
+            sessions = await cur.fetchall()
+            for session in sessions:
+                expired.append(await expire_session(conn, session))
+    return expired
+
+
+@with_db_retry
 async def set_session_message(session_id: str, user_id: int, chat_id: int, message_id: int) -> None:
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -1160,7 +1268,7 @@ async def list_open_sessions(game_type: str | None = None, limit: int = 10) -> l
     pool = await get_pool()
     async with pool.connection() as conn:
         params: list = []
-        where = "status = 'waiting'"
+        where = "status = 'waiting' AND expires_at > NOW()"
         if game_type:
             where += " AND game_type = %s"
             params.append(game_type)

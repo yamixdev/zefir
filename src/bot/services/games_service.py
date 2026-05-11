@@ -7,6 +7,7 @@ from psycopg.types.json import Jsonb
 from bot.config import config
 from bot.db import get_pool, with_db_retry
 from bot.services.economy_service import _add_inventory, _log_event
+from bot.services.time_service import today_msk
 
 
 MS_SIZE = 4
@@ -60,14 +61,32 @@ async def _grant_zefirki(conn, user_id: int, amount: int, reason: str, game_id: 
     await _log_event(conn, user_id, amount, reason, game_id=game_id)
 
 
+async def _balance(conn, user_id: int) -> int:
+    cur = await conn.execute("SELECT zefirki FROM users WHERE user_id = %s", (user_id,))
+    row = await cur.fetchone()
+    return int(row["zefirki"]) if row else 0
+
+
+async def _settlement(conn, user_id: int, result: str, stake: int, payout: int) -> dict:
+    return {
+        "user_id": user_id,
+        "result": result,
+        "stake": stake,
+        "payout": payout,
+        "delta": payout - stake,
+        "balance_after": await _balance(conn, user_id),
+    }
+
+
 async def _remaining_pve_profit_cap(conn, user_id: int) -> int:
+    reward_date = today_msk()
     cur = await conn.execute(
         """
         SELECT COALESCE(SUM(amount), 0) AS won
         FROM game_reward_logs
-        WHERE user_id = %s AND reward_date = CURRENT_DATE
+        WHERE user_id = %s AND COALESCE(reward_date_msk, reward_date) = %s
         """,
-        (user_id,),
+        (user_id, reward_date),
     )
     won = (await cur.fetchone())["won"]
     return max(config.game_daily_win_limit - won, 0)
@@ -77,9 +96,33 @@ async def _record_pve_profit(conn, user_id: int, amount: int, game_id: str) -> N
     if amount <= 0:
         return
     await conn.execute(
-        "INSERT INTO game_reward_logs (user_id, amount, game_id) VALUES (%s, %s, %s)",
-        (user_id, amount, game_id),
+        "INSERT INTO game_reward_logs (user_id, amount, reward_date, reward_date_msk, game_id) VALUES (%s, %s, %s, %s, %s)",
+        (user_id, amount, today_msk(), today_msk(), game_id),
     )
+
+
+async def _maybe_game_key_drop(conn, user_id: int, game_id: str, stake: int) -> dict | None:
+    if stake <= 0:
+        return None
+    roll = _rng.randint(1, 100)
+    key_code = None
+    if roll <= 5:
+        key_code = "gold_key"
+    elif roll <= 12:
+        key_code = "silver_key"
+    elif roll <= 22:
+        key_code = "bronze_key"
+    if not key_code:
+        return None
+    cur = await conn.execute(
+        "SELECT * FROM items WHERE code = %s AND is_active = TRUE",
+        (key_code,),
+    )
+    item = await cur.fetchone()
+    if item:
+        await _add_inventory(conn, user_id, item["id"], 1)
+        await _log_event(conn, user_id, 0, "game_key_drop", item_id=item["id"], game_id=game_id)
+    return item
 
 
 @with_db_retry
@@ -125,10 +168,12 @@ async def play_dice(user_id: int, stake: int = 0) -> dict:
                 await _grant_zefirki(conn, user_id, payout, "game_refund", game_id)
             elif status == "won":
                 cap = await _remaining_pve_profit_cap(conn, user_id)
-                profit = min(stake if stake else 5, cap)
+                profit = min(stake, cap) if stake > 0 else 0
                 payout = stake + profit if stake else profit
-                await _grant_zefirki(conn, user_id, payout, "game_win", game_id)
+                if payout > 0:
+                    await _grant_zefirki(conn, user_id, payout, "game_win", game_id)
                 await _record_pve_profit(conn, user_id, profit, game_id)
+            item = await _maybe_game_key_drop(conn, user_id, game_id, stake) if status == "won" else None
             await conn.execute(
                 """
                 INSERT INTO pve_games (id, user_id, game_type, stake, status, state)
@@ -144,6 +189,9 @@ async def play_dice(user_id: int, stake: int = 0) -> dict:
                 "bot": bot,
                 "payout": payout,
                 "profit": profit,
+                "delta": payout - stake,
+                "balance": await _balance(conn, user_id),
+                "item": item,
             }
 
 
@@ -163,10 +211,12 @@ async def play_guess_number(user_id: int, guess: int, stake: int = 0) -> dict:
             profit = 0
             if status == "won":
                 cap = await _remaining_pve_profit_cap(conn, user_id)
-                profit = min((stake * 3) if stake else 10, cap)
+                profit = min(stake * 3, cap) if stake > 0 else 0
                 payout = stake + profit if stake else profit
-                await _grant_zefirki(conn, user_id, payout, "game_win", game_id)
+                if payout > 0:
+                    await _grant_zefirki(conn, user_id, payout, "game_win", game_id)
                 await _record_pve_profit(conn, user_id, profit, game_id)
+            item = await _maybe_game_key_drop(conn, user_id, game_id, stake) if status == "won" else None
             await conn.execute(
                 """
                 INSERT INTO pve_games (id, user_id, game_type, stake, status, state)
@@ -182,6 +232,9 @@ async def play_guess_number(user_id: int, guess: int, stake: int = 0) -> dict:
                 "secret": secret,
                 "payout": payout,
                 "profit": profit,
+                "delta": payout - stake,
+                "balance": await _balance(conn, user_id),
+                "item": item,
             }
 
 
@@ -225,19 +278,20 @@ async def open_minesweeper_cell(user_id: int, game_id: str, index: int) -> dict:
                     "UPDATE pve_games SET status = 'lost', state = %s, updated_at = NOW() WHERE id = %s",
                     (Jsonb(state), game_id),
                 )
-                return {"ok": True, "status": "lost", "game": game, "state": state, "payout": 0}
+                return {"ok": True, "status": "lost", "game": game, "state": state, "payout": 0, "delta": -game["stake"], "balance": await _balance(conn, user_id)}
 
             revealed.add(index)
             state["revealed"] = sorted(revealed)
             safe_total = MS_SIZE * MS_SIZE - MS_MINES
             if len(revealed) >= safe_total:
                 cap = await _remaining_pve_profit_cap(conn, user_id)
-                profit = min(game["stake"] if game["stake"] else 5, cap)
+                profit = min(game["stake"], cap) if game["stake"] > 0 else 0
                 payout = game["stake"] + profit if game["stake"] else profit
-                await _grant_zefirki(conn, user_id, payout, "game_win", game_id)
+                if payout > 0:
+                    await _grant_zefirki(conn, user_id, payout, "game_win", game_id)
                 await _record_pve_profit(conn, user_id, profit, game_id)
-                item = None
-                if _rng.randint(1, 100) <= 12:
+                item = await _maybe_game_key_drop(conn, user_id, game_id, game["stake"])
+                if item is None and game["stake"] > 0 and _rng.randint(1, 100) <= 12:
                     cur = await conn.execute(
                         """
                         SELECT * FROM items
@@ -254,7 +308,17 @@ async def open_minesweeper_cell(user_id: int, game_id: str, index: int) -> dict:
                     "UPDATE pve_games SET status = 'won', state = %s, updated_at = NOW() WHERE id = %s",
                     (Jsonb(state), game_id),
                 )
-                return {"ok": True, "status": "won", "game": game, "state": state, "payout": payout, "profit": profit, "item": item}
+                return {
+                    "ok": True,
+                    "status": "won",
+                    "game": game,
+                    "state": state,
+                    "payout": payout,
+                    "profit": profit,
+                    "delta": payout - game["stake"],
+                    "balance": await _balance(conn, user_id),
+                    "item": item,
+                }
 
             await conn.execute(
                 "UPDATE pve_games SET state = %s, updated_at = NOW() WHERE id = %s",
@@ -294,11 +358,11 @@ async def create_ttt_room(user_id: int, stake: int = 0) -> dict:
                 return {"ok": False, "error": "not_enough"}
             cur = await conn.execute(
                 """
-                INSERT INTO game_rooms (id, game_type, creator_id, stake, turn_user_id)
-                VALUES (%s, 'ttt', %s, %s, %s)
+                INSERT INTO game_rooms (id, game_type, creator_id, stake, turn_user_id, expires_at)
+                VALUES (%s, 'ttt', %s, %s, %s, NOW() + make_interval(mins => %s))
                 RETURNING *
                 """,
-                (room_id, user_id, stake, user_id),
+                (room_id, user_id, stake, user_id, config.stale_game_timeout_minutes),
             )
             return {"ok": True, "room": await cur.fetchone()}
 
@@ -313,10 +377,11 @@ async def list_waiting_ttt_rooms(limit: int = 10) -> list[dict]:
             FROM game_rooms gr
             JOIN users u ON u.user_id = gr.creator_id
             WHERE gr.game_type = 'ttt' AND gr.status = 'waiting'
+              AND COALESCE(gr.expires_at, gr.updated_at + make_interval(mins => %s)) > NOW()
             ORDER BY gr.created_at DESC
             LIMIT %s
             """,
-            (limit,),
+            (config.stale_game_timeout_minutes, limit),
         )
         return await cur.fetchall()
 
@@ -339,10 +404,11 @@ async def list_user_active_games(user_id: int) -> dict:
             """
             SELECT * FROM game_rooms
             WHERE status IN ('waiting', 'active') AND (creator_id = %s OR opponent_id = %s)
+              AND COALESCE(expires_at, updated_at + make_interval(mins => %s)) > NOW()
             ORDER BY created_at DESC
             LIMIT 10
             """,
-            (user_id, user_id),
+            (user_id, user_id, config.stale_game_timeout_minutes),
         )
         rooms = await cur.fetchall()
         return {"pve": pve, "rooms": rooms}
@@ -395,6 +461,9 @@ async def join_ttt_room(user_id: int, room_id: str) -> dict:
             room = await cur.fetchone()
             if not room:
                 return {"ok": False, "error": "not_available"}
+            if room["status"] in ("waiting", "active") and _room_is_expired(room):
+                expired = await _expire_ttt_room(conn, room)
+                return {"ok": False, "error": "expired", "room": expired}
             if user_id in (room["creator_id"], room["opponent_id"]) and room["status"] in ("waiting", "active"):
                 return {"ok": True, "room": room, "already_in_room": True}
             if room["status"] != "waiting":
@@ -406,11 +475,14 @@ async def join_ttt_room(user_id: int, room_id: str) -> dict:
             cur = await conn.execute(
                 """
                 UPDATE game_rooms
-                   SET opponent_id = %s, status = 'active', updated_at = NOW()
+                   SET opponent_id = %s,
+                       status = 'active',
+                       updated_at = NOW(),
+                       expires_at = NOW() + make_interval(mins => %s)
                  WHERE id = %s
                 RETURNING *
                 """,
-                (user_id, room_id),
+                (user_id, config.stale_game_timeout_minutes, room_id),
             )
             return {"ok": True, "room": await cur.fetchone()}
 
@@ -423,13 +495,61 @@ def _ttt_winner(board: str) -> str | None:
     return None
 
 
-async def _finish_ttt(conn, room: dict, winner_id: int | None, status: str) -> None:
+def _room_is_expired(room: dict) -> bool:
+    now = datetime.now(timezone.utc)
+    expires_at = room.get("expires_at")
+    if expires_at:
+        return expires_at <= now
+    return bool(room.get("updated_at") and now - room["updated_at"] >= timedelta(minutes=config.stale_game_timeout_minutes))
+
+
+async def _finish_ttt(conn, room: dict, winner_id: int | None, status: str) -> list[dict]:
     stake = room["stake"]
+    settlements: list[dict] = []
     if status == "draw" and stake > 0:
         await _grant_zefirki(conn, room["creator_id"], stake, "game_refund", room["id"])
         await _grant_zefirki(conn, room["opponent_id"], stake, "game_refund", room["id"])
+        settlements.append(await _settlement(conn, room["creator_id"], "draw", stake, stake))
+        settlements.append(await _settlement(conn, room["opponent_id"], "draw", stake, stake))
     elif winner_id and stake > 0:
         await _grant_zefirki(conn, winner_id, stake * 2, "game_win", room["id"])
+        for uid in (room["creator_id"], room["opponent_id"]):
+            if uid:
+                payout = stake * 2 if uid == winner_id else 0
+                settlements.append(await _settlement(conn, uid, "won" if uid == winner_id else "lost", stake, payout))
+    else:
+        for uid in (room["creator_id"], room.get("opponent_id")):
+            if uid:
+                settlements.append(await _settlement(conn, uid, "draw" if status == "draw" else "won" if uid == winner_id else "lost", stake, 0))
+    return settlements
+
+
+async def _expire_ttt_room(conn, room: dict) -> dict:
+    settlements: list[dict] = []
+    if room["stake"] > 0:
+        for uid in (room["creator_id"], room.get("opponent_id")):
+            if uid:
+                await _grant_zefirki(conn, uid, room["stake"], "game_refund", room["id"])
+                settlements.append(await _settlement(conn, uid, "expired", room["stake"], room["stake"]))
+    else:
+        for uid in (room["creator_id"], room.get("opponent_id")):
+            if uid:
+                settlements.append(await _settlement(conn, uid, "expired", 0, 0))
+    cur = await conn.execute(
+        """
+        UPDATE game_rooms
+           SET status = 'expired',
+               turn_user_id = NULL,
+               updated_at = NOW()
+         WHERE id = %s
+         RETURNING *
+        """,
+        (room["id"],),
+    )
+    expired = await cur.fetchone()
+    expired = dict(expired)
+    expired["settlements"] = settlements
+    return expired
 
 
 @with_db_retry
@@ -441,6 +561,9 @@ async def ttt_move(user_id: int, room_id: str, index: int) -> dict:
             room = await cur.fetchone()
             if not room or room["status"] != "active":
                 return {"ok": False, "error": "not_active"}
+            if _room_is_expired(room):
+                expired = await _expire_ttt_room(conn, room)
+                return {"ok": False, "error": "expired", "room": expired}
             if user_id not in (room["creator_id"], room["opponent_id"]):
                 return {"ok": False, "error": "not_player", "room": room}
             if room["turn_user_id"] != user_id:
@@ -465,7 +588,7 @@ async def ttt_move(user_id: int, room_id: str, index: int) -> dict:
 
             finished_room = dict(room)
             finished_room["board"] = board
-            await _finish_ttt(conn, finished_room, winner_id, status)
+            settlements = await _finish_ttt(conn, finished_room, winner_id, status)
             cur = await conn.execute(
                 """
                 UPDATE game_rooms
@@ -473,13 +596,17 @@ async def ttt_move(user_id: int, room_id: str, index: int) -> dict:
                        status = %s,
                        winner_id = %s,
                        turn_user_id = %s,
-                       updated_at = NOW()
+                       updated_at = NOW(),
+                       expires_at = NOW() + make_interval(mins => %s)
                  WHERE id = %s
                 RETURNING *
                 """,
-                (board, status, winner_id, next_turn, room_id),
+                (board, status, winner_id, next_turn, config.stale_game_timeout_minutes, room_id),
             )
-            return {"ok": True, "room": await cur.fetchone(), "status": status, "winner_id": winner_id}
+            updated = await cur.fetchone()
+            updated = dict(updated)
+            updated["settlements"] = settlements
+            return {"ok": True, "room": updated, "status": status, "winner_id": winner_id, "settlements": settlements}
 
 
 @with_db_retry
@@ -509,6 +636,9 @@ async def claim_ttt_timeout(user_id: int, room_id: str) -> dict:
             room = await cur.fetchone()
             if not room or room["status"] != "active":
                 return {"ok": False, "error": "not_active"}
+            if _room_is_expired(room):
+                expired = await _expire_ttt_room(conn, room)
+                return {"ok": False, "error": "expired", "room": expired}
             if user_id not in (room["creator_id"], room["opponent_id"]):
                 return {"ok": False, "error": "not_player"}
             if room["turn_user_id"] == user_id:
@@ -516,7 +646,7 @@ async def claim_ttt_timeout(user_id: int, room_id: str) -> dict:
             now = datetime.now(timezone.utc)
             if room["updated_at"] and now - room["updated_at"] < timedelta(minutes=config.ttt_turn_timeout_minutes):
                 return {"ok": False, "error": "too_early", "room": room}
-            await _finish_ttt(conn, room, user_id, "finished")
+            settlements = await _finish_ttt(conn, room, user_id, "finished")
             cur = await conn.execute(
                 """
                 UPDATE game_rooms
@@ -526,4 +656,31 @@ async def claim_ttt_timeout(user_id: int, room_id: str) -> dict:
                 """,
                 (user_id, room_id),
             )
-            return {"ok": True, "room": await cur.fetchone(), "winner_id": user_id}
+            updated = await cur.fetchone()
+            updated = dict(updated)
+            updated["settlements"] = settlements
+            return {"ok": True, "room": updated, "winner_id": user_id, "settlements": settlements}
+
+
+@with_db_retry
+async def expire_stale_ttt_rooms(limit: int = 50) -> list[dict]:
+    expired: list[dict] = []
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute(
+                """
+                SELECT *
+                FROM game_rooms
+                WHERE status IN ('waiting', 'active')
+                  AND COALESCE(expires_at, updated_at + make_interval(mins => %s)) <= NOW()
+                ORDER BY COALESCE(expires_at, updated_at) ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+                """,
+                (config.stale_game_timeout_minutes, limit),
+            )
+            rooms = await cur.fetchall()
+            for room in rooms:
+                expired.append(await _expire_ttt_room(conn, room))
+    return expired

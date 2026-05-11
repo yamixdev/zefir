@@ -16,6 +16,7 @@ from bot.services.games_service import (
     cancel_ttt_room,
     create_ttt_room,
     join_ttt_room,
+    expire_stale_ttt_rooms,
     list_user_active_games,
     list_waiting_ttt_rooms,
     minesweeper_cell_text,
@@ -48,6 +49,7 @@ from bot.services.game_session_service import (
     create_session,
     display_name,
     expire_session_by_id,
+    expire_stale_sessions,
     finish_session,
     get_session,
     handle_session_action,
@@ -59,6 +61,7 @@ from bot.services.game_session_service import (
     start_session,
 )
 from bot.services.rating_service import claim_season_reward, get_ranked_leaderboard
+from bot.services.time_service import format_msk
 from bot.utils import render_clean_message, smart_edit
 
 router = Router()
@@ -71,6 +74,45 @@ class GameStates(StatesGroup):
 
 def _money(n: int) -> str:
     return f"{n:,}".replace(",", " ")
+
+
+def _settlement_line(session: dict, viewer_id: int) -> str:
+    state = session.get("state") or {}
+    for row in state.get("settlements") or []:
+        if int(row.get("user_id") or 0) != viewer_id:
+            continue
+        result_label = {
+            "won": "выигрыш",
+            "lost": "проигрыш",
+            "draw": "возврат",
+            "push": "возврат",
+            "expired": "возврат по таймауту",
+        }.get(row.get("result"), row.get("result") or "итог")
+        delta = int(row.get("delta") or 0)
+        sign = "+" if delta > 0 else ""
+        return (
+            "\n\n<b>Зефирки:</b>\n"
+            f"Ставка: <b>{_money(int(row.get('stake') or 0))}</b> 🍬\n"
+            f"Итог: <b>{html.escape(result_label)}</b>, "
+            f"{sign}{_money(delta)} 🍬\n"
+            f"Баланс: <b>{_money(int(row.get('balance_after') or 0))}</b> 🍬"
+        )
+    return ""
+
+
+def _legacy_settlement_line(room: dict, viewer_id: int) -> str:
+    for row in room.get("settlements") or []:
+        if int(row.get("user_id") or 0) != viewer_id:
+            continue
+        delta = int(row.get("delta") or 0)
+        sign = "+" if delta > 0 else ""
+        return (
+            "\n\n<b>Зефирки:</b>\n"
+            f"Ставка: <b>{_money(int(row.get('stake') or 0))}</b> 🍬\n"
+            f"Итог: <b>{sign}{_money(delta)}</b> 🍬\n"
+            f"Баланс: <b>{_money(int(row.get('balance_after') or 0))}</b> 🍬"
+        )
+    return ""
 
 
 def _games_home_kb() -> InlineKeyboardMarkup:
@@ -458,7 +500,7 @@ async def cb_games_rating(callback: CallbackQuery):
     rows = data["rows"]
     lines = [
         "🏆 <b>Ranked-рейтинг</b>",
-        f"Сезон до: <b>{season['ends_at'].strftime('%d.%m.%Y')}</b>",
+        f"Сезон до: <b>{format_msk(season['ends_at'], '%d.%m.%Y')}</b>",
         f"Награды доступны после сезона при {config.ranked_min_reward_games}+ играх.\n",
     ]
     if not rows:
@@ -499,20 +541,40 @@ async def cb_games_rating_claim(callback: CallbackQuery):
 
 @router.callback_query(F.data == "games:active")
 async def cb_games_active(callback: CallbackQuery):
+    await expire_stale_sessions(limit=30)
+    await expire_stale_ttt_rooms(limit=30)
     data = await list_user_active_games(callback.from_user.id)
     sessions = await list_my_sessions(callback.from_user.id)
+    open_sessions = await list_open_sessions(limit=8)
+    open_rooms = await list_waiting_ttt_rooms(limit=8)
     lines = ["📜 <b>Мои активные игры</b>\n"]
+    kb = InlineKeyboardBuilder()
     if not data["pve"] and not data["rooms"] and not sessions:
         lines.append("Активных игр нет.")
     for session in sessions:
         label = GAME_LABELS.get(session["game_type"], session["game_type"])
         mode = "ranked" if session["ranked"] else (f"{_money(session['stake'])} 🍬" if session["stake"] else "без ставки")
         lines.append(f"🎮 <code>{session['id']}</code> · {label} · {session['status']} · {mode}")
+        kb.row(InlineKeyboardButton(text=f"Открыть {session['id']}", callback_data=f"game:{session['id']}:join:x"))
     for game in data["pve"]:
         lines.append(f"🤖 {game['game_type']} #{game['id']} · ставка {_money(game['stake'])} 🍬")
     for room in data["rooms"]:
         lines.append(f"👥 {room['game_type']} #{room['id']} · {room['status']} · ставка {_money(room['stake'])} 🍬")
-    await smart_edit(callback, "\n".join(lines), reply_markup=_games_home_kb())
+        kb.row(InlineKeyboardButton(text=f"Открыть #{room['id']}", callback_data=f"game:ttt:join:{room['id']}"))
+    joinable_sessions = [s for s in open_sessions if s["creator_id"] != callback.from_user.id]
+    joinable_rooms = [r for r in open_rooms if r["creator_id"] != callback.from_user.id]
+    if joinable_sessions or joinable_rooms:
+        lines.append("\n<b>Свободные комнаты:</b>")
+    for session in joinable_sessions[:5]:
+        label = GAME_LABELS.get(session["game_type"], session["game_type"])
+        lines.append(f"• <code>{session['id']}</code> · {label} · ставка {_money(session['stake'])} 🍬")
+        kb.row(InlineKeyboardButton(text=f"Присоединиться {session['id']}", callback_data=f"game:{session['id']}:join:x"))
+    for room in joinable_rooms[:5]:
+        owner = room.get("first_name") or room.get("username") or str(room["creator_id"])
+        lines.append(f"• #{room['id']} · {html.escape(owner)} · ставка {_money(room['stake'])} 🍬")
+        kb.row(InlineKeyboardButton(text=f"Присоединиться #{room['id']}", callback_data=f"game:ttt:join:{room['id']}"))
+    kb.row(InlineKeyboardButton(text="🎮 Игры", callback_data="games:home"))
+    await smart_edit(callback, "\n".join(lines), reply_markup=kb.as_markup())
     await callback.answer()
 
 
@@ -661,7 +723,7 @@ def _session_text(session: dict, viewer_id: int) -> str:
                     name = html.escape(display_name(player)) if player else str(place["user_id"])
                     rows.append(f"{place['place']}. {name} — <b>{place['score']}</b>")
                 winner += "\n".join(rows)
-        return f"🎮 <b>{label}</b>\n\n{status}{winner}{_chat_text(session)}"
+        return f"🎮 <b>{label}</b>\n\n{status}{winner}{_settlement_line(session, viewer_id)}{_chat_text(session)}"
 
     state = session.get("state") or {}
     players = session.get("players") or []
@@ -870,11 +932,22 @@ async def _finish_and_sync(callback: CallbackQuery, session_id: str, winner_id: 
     return session
 
 
-async def process_due_game_events(bot: Bot, limit: int = 20) -> int:
+async def process_due_game_events(bot: Bot, limit: int = 20) -> dict:
     sessions = await activate_due_duel_signals(limit=limit)
-    for session in sessions:
+    expired_sessions = await expire_stale_sessions(limit=50)
+    expired_rooms = await expire_stale_ttt_rooms(limit=50)
+    for session in [*sessions, *expired_sessions]:
         await _sync_session_messages(bot, session)
-    return len(sessions)
+    for room in expired_rooms:
+        if room.get("creator_id"):
+            await _sync_ttt_player(bot, room, room["creator_id"])
+        if room.get("opponent_id"):
+            await _sync_ttt_player(bot, room, room["opponent_id"])
+    return {
+        "duel_signals": len(sessions),
+        "expired_sessions": len(expired_sessions),
+        "expired_rooms": len(expired_rooms),
+    }
 
 
 def _quiz_start_next_question(state_data: dict) -> dict:
@@ -1113,7 +1186,11 @@ async def cb_ms_open(callback: CallbackQuery):
     status = result.get("status", game.get("status"))
     reveal_all = status in ("won", "lost")
     if status == "lost":
-        text = "💥 <b>Мина!</b>\n\nСтавка сгорела. Можно попробовать ещё раз."
+        text = (
+            "💥 <b>Мина!</b>\n\n"
+            f"Потеря: <b>-{_money(result.get('game', {}).get('stake', 0))}</b> 🍬\n"
+            f"Баланс: <b>{_money(result.get('balance', 0))}</b> 🍬"
+        )
     elif status == "won":
         item_line = ""
         if result.get("item"):
@@ -1121,6 +1198,8 @@ async def cb_ms_open(callback: CallbackQuery):
         text = (
             "🏆 <b>Победа в сапёре!</b>\n\n"
             f"Выплата: <b>{_money(result.get('payout', 0))}</b> 🍬\n"
+            f"Итог: <b>{'+' if result.get('delta', 0) > 0 else ''}{_money(result.get('delta', 0))}</b> 🍬\n"
+            f"Баланс: <b>{_money(result.get('balance', 0))}</b> 🍬\n"
             f"Прибыль к дневному лимиту: <b>{_money(result.get('profit', 0))}</b> 🍬"
             f"{item_line}"
         )
@@ -1138,12 +1217,16 @@ async def cb_dice(callback: CallbackQuery):
         await callback.answer("Не хватает зефирок для ставки.", show_alert=True)
         return
     status = {"won": "🏆 Победа", "lost": "😿 Проигрыш", "draw": "🤝 Ничья"}[result["status"]]
+    item_line = f"\n🎁 Предмет: <b>{html.escape(result['item']['name'])}</b>" if result.get("item") else ""
     text = (
         f"🎲 <b>Кости</b>\n\n"
         f"Ты: <b>{result['player']}</b>\n"
         f"Бот: <b>{result['bot']}</b>\n\n"
         f"{status}\n"
-        f"Выплата: <b>{_money(result['payout'])}</b> 🍬"
+        f"Выплата: <b>{_money(result['payout'])}</b> 🍬\n"
+        f"Итог: <b>{'+' if result.get('delta', 0) > 0 else ''}{_money(result.get('delta', 0))}</b> 🍬\n"
+        f"Баланс: <b>{_money(result.get('balance', 0))}</b> 🍬"
+        f"{item_line}"
     )
     await smart_edit(callback, text, reply_markup=_bot_games_kb())
     await callback.answer()
@@ -1157,12 +1240,16 @@ async def cb_guess(callback: CallbackQuery):
         await callback.answer("Не хватает зефирок для ставки.", show_alert=True)
         return
     status = "🏆 Угадал" if result["status"] == "won" else "😿 Не угадал"
+    item_line = f"\n🎁 Предмет: <b>{html.escape(result['item']['name'])}</b>" if result.get("item") else ""
     text = (
         "🔢 <b>Угадай число</b>\n\n"
         f"Твой выбор: <b>{result['guess']}</b>\n"
         f"Выпало: <b>{result['secret']}</b>\n\n"
         f"{status}\n"
-        f"Выплата: <b>{_money(result['payout'])}</b> 🍬"
+        f"Выплата: <b>{_money(result['payout'])}</b> 🍬\n"
+        f"Итог: <b>{'+' if result.get('delta', 0) > 0 else ''}{_money(result.get('delta', 0))}</b> 🍬\n"
+        f"Баланс: <b>{_money(result.get('balance', 0))}</b> 🍬"
+        f"{item_line}"
     )
     await smart_edit(callback, text, reply_markup=_bot_games_kb())
     await callback.answer()
@@ -1210,6 +1297,10 @@ def _ttt_text(room: dict, viewer_id: int | None = None) -> str:
         text += f"\n🏆 Победитель: <code>{room['winner_id']}</code>"
     elif room["status"] == "cancelled":
         text += "\nКомната отменена."
+    elif room["status"] == "expired":
+        text += "\n⏳ Комната закрыта из-за бездействия. Ставки возвращены."
+    if viewer_id:
+        text += _legacy_settlement_line(room, viewer_id)
     return text
 
 
@@ -1311,7 +1402,7 @@ async def msg_ttt_join_code(message, state: FSMContext, bot: Bot):
     result = await join_ttt_room(message.from_user.id, room_id)
     await state.clear()
     if not result["ok"]:
-        text = "❌ Не удалось войти. Комната не найдена, закрыта или не хватает зефирок."
+        text = "❌ Комната закрыта из-за бездействия." if result.get("error") == "expired" else "❌ Не удалось войти. Комната не найдена, закрыта или не хватает зефирок."
         kb = _pvp_games_kb()
     else:
         room = result["room"]
@@ -1373,6 +1464,7 @@ async def cmd_join_room(message, command: CommandObject, bot: Bot):
     if not result["ok"]:
         errors = {
             "not_available": "Комната уже недоступна или не найдена.",
+            "expired": "Комната закрыта из-за бездействия.",
             "own_room": "Нельзя войти в свою комнату.",
             "not_enough": "Не хватает зефирок для ставки.",
         }
@@ -1419,6 +1511,7 @@ async def cb_ttt_join(callback: CallbackQuery):
     if not result["ok"]:
         errors = {
             "not_available": "Комната уже недоступна.",
+            "expired": "Комната закрыта из-за бездействия.",
             "own_room": "Нельзя войти в свою комнату.",
             "not_enough": "Не хватает зефирок для ставки.",
         }
@@ -1439,6 +1532,7 @@ async def cb_ttt_move(callback: CallbackQuery):
     if not result["ok"]:
         errors = {
             "not_active": "Игра не активна.",
+            "expired": "Комната закрыта из-за бездействия.",
             "not_player": "Ты не участник этой комнаты.",
             "not_turn": "Сейчас не твой ход.",
             "bad_cell": "Клетка занята.",

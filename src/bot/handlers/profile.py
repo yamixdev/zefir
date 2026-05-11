@@ -20,6 +20,7 @@ from bot.services.economy_service import get_my_listings
 from bot.services.games_service import list_user_active_games
 from bot.services.game_session_service import list_my_sessions
 from bot.services.pet_service import get_pet, SPECIES
+from bot.services.time_service import format_msk, today_msk
 
 
 _REASON_LABELS = {
@@ -75,8 +76,8 @@ async def _daily_available(user_id: int) -> bool:
     pool = await get_pool()
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "SELECT 1 FROM daily_claims WHERE user_id = %s AND claim_date = CURRENT_DATE",
-            (user_id,),
+            "SELECT 1 FROM daily_claims WHERE user_id = %s AND claim_date = %s",
+            (user_id, today_msk()),
         )
         return await cur.fetchone() is None
 
@@ -218,7 +219,7 @@ async def cb_profile_admin(callback: CallbackQuery):
         f"👤 <b>{name}</b>\n"
         f"🔖 {username}\n"
         f"🆔 <code>{user['user_id']}</code>\n"
-        f"📅 С {user['created_at'].strftime('%d.%m.%Y')}\n\n"
+        f"📅 С {format_msk(user['created_at'], '%d.%m.%Y')}\n\n"
         f"🍬 Баланс: <b>{_money(zefirki)}</b>\n"
         f"🤖 AI: <b>{ai_info['remaining']}</b> доступно, сброс: <b>{reset_str}</b>{bonus_line}\n"
         f"📬 Твои тикеты: <b>{tstats['replied']}</b>/<b>{tstats['total']}</b> отвечено"

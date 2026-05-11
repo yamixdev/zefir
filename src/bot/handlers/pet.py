@@ -13,12 +13,16 @@ from bot.services.pet_service import (
     SPECIES,
     create_pet,
     equip_pet_cosmetic,
+    get_pet_home,
     get_pet,
     get_or_create_pet,
     list_pets,
+    move_pet_room,
+    play_pet_minigame,
     perform_pet_action,
     rename_pet,
     set_active_pet,
+    ROOMS,
 )
 from bot.utils import render_clean_message, smart_edit
 
@@ -61,13 +65,14 @@ def _pet_kb(pets: list[dict] | None = None) -> InlineKeyboardMarkup:
     )
     kb.row(
         InlineKeyboardButton(text="🧼 Мыть", callback_data="pet:act:wash"),
-        InlineKeyboardButton(text="🎾 Играть", callback_data="pet:act:play"),
+        InlineKeyboardButton(text="🎾 Играть", callback_data="pet:minigame:random"),
     )
     kb.row(
         InlineKeyboardButton(text="🤍 Гладить", callback_data="pet:act:pet"),
         InlineKeyboardButton(text="💤 Спать", callback_data="pet:act:sleep"),
     )
     kb.row(InlineKeyboardButton(text="🩹 Забота", callback_data="pet:act:heal"))
+    kb.row(InlineKeyboardButton(text="🏠 Домик", callback_data="pet:home:view"))
     kb.row(InlineKeyboardButton(text="✏️ Имя", callback_data="pet:rename"))
     kb.row(InlineKeyboardButton(text="🎒 Предметы для питомца", callback_data="econ:inv:c:food"))
     kb.row(InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun"))
@@ -77,10 +82,14 @@ def _pet_kb(pets: list[dict] | None = None) -> InlineKeyboardMarkup:
 def _pet_text(pet: dict) -> str:
     cosmetic = pet.get("cosmetic_name") or "без косметики"
     sp = SPECIES.get(pet.get("species"), SPECIES["cat"])
+    room = pet.get("room_label") or ROOMS.get(pet.get("room"), "комната")
+    state = pet.get("state_text") or "спокойно занимается своими делами"
     return (
         f"{sp['emoji']} <b>{html.escape(pet['name'])}</b> · {sp['name']}\n\n"
         f"Уровень: <b>{pet['level']}</b>\n"
         f"Опыт: <b>{pet['xp']}</b>/след. уровень\n\n"
+        f"Комната: <b>{html.escape(room)}</b>\n"
+        f"Сейчас: <i>{html.escape(state)}</i>\n"
         f"Образ: <b>{html.escape(cosmetic)}</b>\n\n"
         f"Сытость: <b>{pet['hunger']}</b> {_bar(pet['hunger'])}\n"
         f"Жажда: <b>{pet['thirst']}</b> {_bar(pet['thirst'])}\n"
@@ -89,8 +98,45 @@ def _pet_text(pet: dict) -> str:
         f"Энергия: <b>{pet['energy']}</b> {_bar(pet['energy'])}\n\n"
         f"Здоровье: <b>{pet['health']}</b> {_bar(pet['health'])}\n"
         f"Привязанность: <b>{pet['affection']}</b> {_bar(pet['affection'])}\n\n"
-        "<i>Каждое действие можно сделать один раз в день.</i>"
+        "<i>Состояние меняется со временем. Если долго не заходить, питомец устанет и заскучает.</i>"
     )
+
+
+def _home_text(data: dict) -> str:
+    home = data["home"]
+    by_room: dict[str, list[str]] = {}
+    for item in data["items"]:
+        by_room.setdefault(item["room"], []).append(item_label(item))
+    lines = [
+        "🏠 <b>Домик питомцев</b>",
+        f"Уровень домика: <b>{home['level']}</b>",
+        f"Активная комната: <b>{html.escape(ROOMS.get(home['active_room'], home['active_room']))}</b>\n",
+        "<b>Комнаты:</b>",
+    ]
+    for code, label in ROOMS.items():
+        items = ", ".join(by_room.get(code, [])) or "пока пусто"
+        lines.append(f"• {html.escape(label)}: {items}")
+    if data["events"]:
+        lines.append("\n<b>Недавние события:</b>")
+        for event in data["events"][:3]:
+            lines.append(f"• {html.escape(event['text'])}")
+    return "\n".join(lines)
+
+
+def _home_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="Кухня", callback_data="pet:room:kitchen"),
+        InlineKeyboardButton(text="Спальня", callback_data="pet:room:bedroom"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="Игровая", callback_data="pet:room:playroom"),
+        InlineKeyboardButton(text="Ванная", callback_data="pet:room:bathroom"),
+    )
+    kb.row(InlineKeyboardButton(text="Двор", callback_data="pet:room:yard"))
+    kb.row(InlineKeyboardButton(text="🎒 Предметы домика", callback_data="econ:inv:c:home"))
+    kb.row(InlineKeyboardButton(text="🐾 К питомцу", callback_data="pet:home"))
+    return kb.as_markup()
 
 
 @router.callback_query(F.data == "pet:home")
@@ -131,12 +177,39 @@ async def cb_pet_switch(callback: CallbackQuery):
     await callback.answer("Активный питомец изменён")
 
 
+@router.callback_query(F.data == "pet:home:view")
+async def cb_pet_home_view(callback: CallbackQuery):
+    data = await get_pet_home(callback.from_user.id)
+    await smart_edit(callback, _home_text(data), reply_markup=_home_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("pet:room:"))
+async def cb_pet_room(callback: CallbackQuery):
+    room = callback.data.split(":")[2]
+    result = await move_pet_room(callback.from_user.id, room)
+    if not result["ok"]:
+        await callback.answer("Сначала выбери питомца.", show_alert=True)
+        return
+    data = await get_pet_home(callback.from_user.id)
+    await smart_edit(callback, _home_text(data), reply_markup=_home_kb())
+    await callback.answer(f"Комната: {ROOMS.get(room, room)}")
+
+
 @router.callback_query(F.data.startswith("pet:equip:"))
 async def cb_pet_equip(callback: CallbackQuery):
     item_id = int(callback.data.split(":")[2])
     result = await equip_pet_cosmetic(callback.from_user.id, item_id)
     if not result["ok"]:
-        msg = "Сначала выбери питомца." if result.get("error") == "no_pet" else "Эту косметику нельзя надеть."
+        if result.get("error") == "no_pet":
+            msg = "Сначала выбери питомца."
+        elif result.get("error") == "already_equipped":
+            msg = "Этот предмет уже надет на питомце."
+        else:
+            msg = "Эту косметику нельзя надеть."
+        if result.get("pet"):
+            pets = await list_pets(callback.from_user.id)
+            await smart_edit(callback, _pet_text(result["pet"]), reply_markup=_pet_kb(pets))
         await callback.answer(msg, show_alert=True)
         return
     pets = await list_pets(callback.from_user.id)
@@ -215,6 +288,42 @@ async def cb_pet_action(callback: CallbackQuery):
     )
     await smart_edit(callback, text, reply_markup=_pet_kb(pets))
     await callback.answer("Готово")
+
+
+@router.callback_query(F.data.startswith("pet:minigame:"))
+async def cb_pet_minigame(callback: CallbackQuery):
+    game_code = callback.data.split(":")[2]
+    if game_code == "random":
+        game_code = None
+    result = await play_pet_minigame(callback.from_user.id, game_code)
+    if not result["ok"]:
+        if result.get("error") == "low_energy":
+            await callback.answer("Питомец устал. Дай ему отдохнуть.", show_alert=True)
+        elif result.get("error") == "no_pet":
+            await callback.answer("Сначала выбери питомца.", show_alert=True)
+        else:
+            await callback.answer("Мини-игра сейчас недоступна.", show_alert=True)
+        pet = result.get("pet") or await get_pet(callback.from_user.id)
+        if pet:
+            pets = await list_pets(callback.from_user.id)
+            await smart_edit(callback, _pet_text(pet), reply_markup=_pet_kb(pets))
+        return
+    pet = result["pet"]
+    pets = await list_pets(callback.from_user.id)
+    result_label = {"great": "отлично", "good": "хорошо", "ok": "нормально"}.get(result["result"], result["result"])
+    extra = f"\n\n<i>{html.escape(result['reaction'])}</i>"
+    if result.get("item"):
+        extra += f"\n\n🎁 Найден предмет: {item_label(result['item'])}"
+    if result.get("level_up"):
+        extra += "\n\n🎉 Уровень питомца вырос!"
+    text = (
+        f"🎮 <b>{html.escape(result['game']['name'])}</b>\n\n"
+        f"Результат: <b>{result_label}</b>\n"
+        f"Опыт: <b>+{result['xp']}</b>{extra}\n\n"
+        f"{_pet_text(pet)}"
+    )
+    await smart_edit(callback, text, reply_markup=_pet_kb(pets))
+    await callback.answer("Мини-игра завершена")
 
 
 @router.callback_query(F.data == "pet:rename")

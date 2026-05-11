@@ -628,6 +628,127 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
                 ON news_posts (status, notification_until, published_at DESC);
         """,
     ),
+    (
+        "20260510_002_admin_ops_stability",
+        """
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS last_action TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_id BIGINT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason_code TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason_text TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_at TIMESTAMPTZ;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_by BIGINT REFERENCES users(user_id);
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_blocked_at TIMESTAMPTZ;
+
+            CREATE INDEX IF NOT EXISTS idx_users_last_active
+                ON users (last_active_at DESC);
+
+            CREATE TABLE IF NOT EXISTS user_activity_events (
+                id          BIGSERIAL PRIMARY KEY,
+                user_id     BIGINT REFERENCES users(user_id),
+                event_type  TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                chat_id     BIGINT,
+                context     JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_activity_user_created
+                ON user_activity_events (user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_user_activity_created
+                ON user_activity_events (created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS bot_incidents (
+                id             BIGSERIAL PRIMARY KEY,
+                user_id         BIGINT REFERENCES users(user_id),
+                chat_id         BIGINT,
+                event_type      TEXT NOT NULL DEFAULT 'auto',
+                action          TEXT,
+                status          TEXT NOT NULL DEFAULT 'open',
+                title           TEXT NOT NULL,
+                message         TEXT,
+                traceback_text  TEXT,
+                admin_note      TEXT,
+                closed_by       BIGINT REFERENCES users(user_id),
+                closed_at       TIMESTAMPTZ,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_bot_incidents_status_created
+                ON bot_incidents (status, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_bot_incidents_user_created
+                ON bot_incidents (user_id, created_at DESC);
+
+            ALTER TABLE game_rooms ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ
+                DEFAULT NOW() + INTERVAL '5 minutes';
+            UPDATE game_rooms
+               SET expires_at = COALESCE(expires_at, updated_at + INTERVAL '5 minutes', NOW() + INTERVAL '5 minutes')
+             WHERE status IN ('waiting', 'active');
+            CREATE INDEX IF NOT EXISTS idx_game_rooms_status_expires
+                ON game_rooms (status, expires_at);
+        """,
+    ),
+    (
+        "20260511_001_content_time_and_pets",
+        """
+            ALTER TABLE game_reward_logs ADD COLUMN IF NOT EXISTS reward_date_msk DATE;
+            UPDATE game_reward_logs
+               SET reward_date_msk = COALESCE(reward_date_msk, reward_date)
+             WHERE reward_date_msk IS NULL;
+            ALTER TABLE game_reward_logs
+                ALTER COLUMN reward_date SET DEFAULT ((NOW() AT TIME ZONE 'Europe/Moscow')::date),
+                ALTER COLUMN reward_date_msk SET DEFAULT ((NOW() AT TIME ZONE 'Europe/Moscow')::date);
+            CREATE INDEX IF NOT EXISTS idx_game_reward_logs_user_msk
+                ON game_reward_logs (user_id, reward_date_msk);
+
+            ALTER TABLE daily_claims
+                ALTER COLUMN claim_date SET DEFAULT ((NOW() AT TIME ZONE 'Europe/Moscow')::date);
+            ALTER TABLE pet_actions
+                ALTER COLUMN action_date SET DEFAULT ((NOW() AT TIME ZONE 'Europe/Moscow')::date);
+
+            ALTER TABLE cases ADD COLUMN IF NOT EXISTS required_key_item_id INT REFERENCES items(id);
+            ALTER TABLE cases ADD COLUMN IF NOT EXISTS min_level INT NOT NULL DEFAULT 1;
+            ALTER TABLE cases ADD COLUMN IF NOT EXISTS sort_order INT NOT NULL DEFAULT 100;
+
+            CREATE TABLE IF NOT EXISTS shop_rotations (
+                rotation_key TEXT PRIMARY KEY,
+                starts_at    TIMESTAMPTZ NOT NULL,
+                ends_at      TIMESTAMPTZ NOT NULL,
+                created_at   TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS pet_homes (
+                user_id      BIGINT PRIMARY KEY REFERENCES users(user_id),
+                level        INT NOT NULL DEFAULT 1,
+                active_room  TEXT NOT NULL DEFAULT 'kitchen',
+                created_at   TIMESTAMPTZ DEFAULT NOW(),
+                updated_at   TIMESTAMPTZ DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS pet_home_items (
+                user_id      BIGINT REFERENCES users(user_id),
+                room         TEXT NOT NULL,
+                item_id      INT REFERENCES items(id),
+                installed_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (user_id, room, item_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS pet_status_events (
+                id         BIGSERIAL PRIMARY KEY,
+                user_id    BIGINT REFERENCES users(user_id),
+                pet_id     BIGINT REFERENCES pets(id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL,
+                text       TEXT NOT NULL,
+                meta       JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_pet_status_events_user_created
+                ON pet_status_events (user_id, created_at DESC);
+
+            ALTER TABLE pets ADD COLUMN IF NOT EXISTS room TEXT NOT NULL DEFAULT 'kitchen';
+            ALTER TABLE pets ADD COLUMN IF NOT EXISTS last_decay_at TIMESTAMPTZ;
+            UPDATE pets SET last_decay_at = COALESCE(last_decay_at, updated_at, NOW()) WHERE last_decay_at IS NULL;
+        """,
+    ),
 )
 
 
@@ -668,23 +789,74 @@ async def seed_default_content(conn) -> None:
             INSERT INTO items (code, name, description, rarity, item_type, category, effect_json, base_price, shop_price, is_shop_item, sellable, usable)
             VALUES
                 ('crumb', 'Крошка зефира', 'Самая простая коллекционная мелочь.', 'trash', 'collectible', 'collectible', '{}'::jsonb, 5, NULL, FALSE, TRUE, FALSE),
-                ('ribbon', 'Ленточка питомца', 'Милый аксессуар для питомца.', 'common', 'cosmetic', 'clothes', '{}'::jsonb, 25, 60, TRUE, TRUE, FALSE),
+                ('soft_crumb', 'Мягкая крошка', 'Небольшой сувенир из обычных прогулок.', 'trash', 'collectible', 'collectible', '{}'::jsonb, 8, NULL, FALSE, TRUE, FALSE),
+                ('paper_star', 'Бумажная звёздочка', 'Лёгкая коллекционная безделушка.', 'trash', 'collectible', 'collectible', '{}'::jsonb, 10, NULL, FALSE, TRUE, FALSE),
                 ('ai_cookie', 'AI-печенька', 'Добавляет 10 бонусных AI-запросов.', 'uncommon', 'ai_bonus', 'tech', '{"ai_bonus": 10}'::jsonb, 60, 120, TRUE, TRUE, TRUE),
+                ('ai_muffin', 'AI-маффин', 'Добавляет 25 бонусных AI-запросов.', 'rare', 'ai_bonus', 'tech', '{"ai_bonus": 25}'::jsonb, 150, 260, TRUE, TRUE, TRUE),
+
+                ('cheap_food', 'Сухой корм', 'Недорогая еда: сытно, но без восторга.', 'common', 'pet_consumable', 'food', '{"hunger": 18, "health": -1, "mood": 1}'::jsonb, 20, 35, TRUE, TRUE, TRUE),
+                ('fish_bits', 'Рыбные кусочки', 'Котики особенно ценят этот запах.', 'uncommon', 'pet_consumable', 'food', '{"hunger": 24, "mood": 5, "affection": 1}'::jsonb, 45, 75, TRUE, TRUE, TRUE),
+                ('meat_bowl', 'Мясная миска', 'Плотный обед для активного питомца.', 'uncommon', 'pet_consumable', 'food', '{"hunger": 28, "energy": 4, "health": 1}'::jsonb, 55, 90, TRUE, TRUE, TRUE),
+                ('veggie_mix', 'Овощной микс', 'Лёгкая еда, полезная для здоровья.', 'common', 'pet_consumable', 'food', '{"hunger": 16, "health": 3}'::jsonb, 30, 50, TRUE, TRUE, TRUE),
+                ('nut_mix', 'Ореховая смесь', 'Белочка точно оценит запас на потом.', 'uncommon', 'pet_consumable', 'food', '{"hunger": 22, "mood": 4, "energy": 3}'::jsonb, 50, 85, TRUE, TRUE, TRUE),
+                ('premium_food', 'Премиум-рагу', 'Качественная еда для здоровья и настроения.', 'rare', 'pet_consumable', 'food', '{"hunger": 35, "health": 4, "mood": 8, "affection": 2}'::jsonb, 140, 210, TRUE, TRUE, TRUE),
+                ('chef_plate', 'Тарелка от шефа', 'Редкий ужин, после которого питомец заметно бодрее.', 'epic', 'pet_consumable', 'food', '{"hunger": 45, "health": 7, "mood": 12, "affection": 4}'::jsonb, 360, 560, TRUE, TRUE, TRUE),
                 ('pet_snack', 'Лакомство питомца', 'Хороший перекус для питомца.', 'rare', 'pet_boost', 'food', '{"hunger": 25, "mood": 10, "energy": 10}'::jsonb, 120, 180, TRUE, TRUE, TRUE),
+                ('marshmallow_treat', 'Зефирное лакомство', 'Маленькая сладость для хорошего настроения.', 'uncommon', 'pet_consumable', 'food', '{"hunger": 12, "mood": 14, "affection": 2}'::jsonb, 70, 115, TRUE, TRUE, TRUE),
+
+                ('water_bottle', 'Бутылочка воды', 'Восстанавливает жажду питомца.', 'common', 'pet_consumable', 'drink', '{"thirst": 30, "health": 1}'::jsonb, 18, 30, TRUE, TRUE, TRUE),
+                ('clean_water_bowl', 'Чистая миска воды', 'Простой и надёжный способ напоить питомца.', 'common', 'pet_consumable', 'drink', '{"thirst": 24, "mood": 1}'::jsonb, 22, 38, TRUE, TRUE, TRUE),
+                ('berry_soda', 'Ягодная газировка', 'Сладко, бодро, но без лишней суеты.', 'uncommon', 'pet_consumable', 'drink', '{"thirst": 20, "mood": 10, "energy": 4}'::jsonb, 55, 90, TRUE, TRUE, TRUE),
+                ('mint_drink', 'Мятный напиток', 'Освежает и немного успокаивает.', 'uncommon', 'pet_consumable', 'drink', '{"thirst": 28, "health": 2, "mood": 3}'::jsonb, 65, 100, TRUE, TRUE, TRUE),
+                ('energy_drop', 'Бодрая капля', 'Немного энергии перед игрой.', 'rare', 'pet_consumable', 'drink', '{"thirst": 12, "energy": 18, "mood": 4}'::jsonb, 130, 210, TRUE, TRUE, TRUE),
+
+                ('shampoo', 'Пенный шампунь', 'Чистота и приятный запах.', 'uncommon', 'pet_consumable', 'care', '{"cleanliness": 35, "health": 2, "mood": 3}'::jsonb, 70, 110, TRUE, TRUE, TRUE),
+                ('soft_towel', 'Мягкое полотенце', 'Быстро возвращает уют после мытья.', 'common', 'pet_consumable', 'care', '{"cleanliness": 18, "mood": 4}'::jsonb, 35, 60, TRUE, TRUE, TRUE),
+                ('pet_brush', 'Щётка для шерсти', 'Уход без спешки и лишнего стресса.', 'uncommon', 'pet_consumable', 'care', '{"cleanliness": 22, "affection": 3, "mood": 3}'::jsonb, 65, 105, TRUE, TRUE, TRUE),
+                ('first_aid', 'Аптечка заботы', 'Помогает, если питомец устал или приболел.', 'rare', 'pet_consumable', 'care', '{"health": 24, "mood": 2, "energy": -2}'::jsonb, 150, 240, TRUE, TRUE, TRUE),
+                ('spa_foam', 'Спа-пенка', 'Дорогой уход для чистоты и настроения.', 'epic', 'pet_consumable', 'care', '{"cleanliness": 45, "health": 5, "mood": 10, "affection": 3}'::jsonb, 320, 520, TRUE, TRUE, TRUE),
+
+                ('toy_mouse', 'Игрушечная мышь', 'Игрушка для активной игры.', 'common', 'pet_toy', 'toy', '{"mood": 12, "energy": -8, "xp": 10}'::jsonb, 45, 80, TRUE, TRUE, TRUE),
+                ('rubber_ball', 'Резиновый мячик', 'Простая игра на пару минут.', 'common', 'pet_toy', 'toy', '{"mood": 10, "energy": -6, "xp": 8}'::jsonb, 35, 65, TRUE, TRUE, TRUE),
+                ('frisbee', 'Лёгкий фрисби', 'Подходит для двора и тренировки реакции.', 'uncommon', 'pet_toy', 'toy', '{"mood": 16, "energy": -10, "xp": 14}'::jsonb, 85, 140, TRUE, TRUE, TRUE),
+                ('laser_pointer', 'Лазерная указка', 'Быстрая игра для внимательного питомца.', 'rare', 'pet_toy', 'toy', '{"mood": 22, "energy": -14, "xp": 20}'::jsonb, 180, 300, TRUE, TRUE, TRUE),
+                ('puzzle_box', 'Коробка-головоломка', 'Питомец получает опыт, пока ищет решение.', 'rare', 'pet_toy', 'toy', '{"mood": 12, "energy": -8, "xp": 26, "affection": 2}'::jsonb, 210, 340, TRUE, TRUE, TRUE),
+                ('training_tunnel', 'Тренировочный тоннель', 'Игрушка для активных забегов.', 'epic', 'pet_toy', 'toy', '{"mood": 24, "energy": -18, "xp": 34, "affection": 3}'::jsonb, 420, 680, TRUE, TRUE, TRUE),
+                ('music_speaker', 'Мини-колонка', 'Включает питомцу музыку и поднимает настроение.', 'rare', 'pet_toy', 'tech', '{"mood": 22, "energy": 3, "xp": 8}'::jsonb, 220, 360, TRUE, TRUE, TRUE),
+                ('pocket_player', 'Карманный плеер', 'Тихая музыка для отдыха питомца.', 'uncommon', 'pet_toy', 'tech', '{"mood": 14, "energy": 4, "xp": 6}'::jsonb, 120, 190, TRUE, TRUE, TRUE),
+
+                ('ribbon', 'Ленточка питомца', 'Милый аксессуар для питомца.', 'common', 'cosmetic', 'clothes', '{"cosmetic_slot": "neck"}'::jsonb, 25, 60, TRUE, TRUE, FALSE),
+                ('red_cap', 'Рыжая кепка', 'Стильная кепка для питомца.', 'uncommon', 'cosmetic', 'clothes', '{"cosmetic_slot": "head"}'::jsonb, 95, 150, TRUE, TRUE, FALSE),
+                ('blue_cap', 'Синяя кепка', 'Спокойный образ на каждый день.', 'common', 'cosmetic', 'clothes', '{"cosmetic_slot": "head"}'::jsonb, 70, 120, TRUE, TRUE, FALSE),
+                ('raincoat', 'Дождевик', 'Для прогулок, когда погода спорная.', 'rare', 'cosmetic', 'clothes', '{"cosmetic_slot": "body"}'::jsonb, 230, 380, TRUE, TRUE, FALSE),
+                ('squirrel_hoodie', 'Худи Белочки', 'Рыжий образ для самых шумных прогулок.', 'epic', 'cosmetic', 'clothes', '{"cosmetic_slot": "body"}'::jsonb, 400, 650, TRUE, TRUE, FALSE),
+                ('star_glasses', 'Звёздные очки', 'Питомец выглядит так, будто знает секрет.', 'rare', 'cosmetic', 'accessory', '{"cosmetic_slot": "face"}'::jsonb, 260, 430, TRUE, TRUE, FALSE),
+                ('silver_collar', 'Серебряный ошейник', 'Аккуратная редкая косметика.', 'rare', 'cosmetic', 'accessory', '{"cosmetic_slot": "neck"}'::jsonb, 300, 480, TRUE, TRUE, FALSE),
+                ('tiny_backpack', 'Маленький рюкзак', 'Питомец будто собрался в путешествие.', 'uncommon', 'cosmetic', 'accessory', '{"cosmetic_slot": "back"}'::jsonb, 150, 240, TRUE, TRUE, FALSE),
+                ('royal_cape', 'Королевская накидка', 'Эпичный образ для важного питомца.', 'epic', 'cosmetic', 'clothes', '{"cosmetic_slot": "body"}'::jsonb, 520, 820, TRUE, TRUE, FALSE),
+                ('moon_crown', 'Лунная корона', 'Легендарная косметика с мягким свечением.', 'legendary', 'cosmetic', 'accessory', '{"cosmetic_slot": "head"}'::jsonb, 1400, NULL, FALSE, TRUE, FALSE),
+                ('sunny_halo', 'Солнечный нимб', 'Легендарный аксессуар для коллекции.', 'legendary', 'cosmetic', 'accessory', '{"cosmetic_slot": "head"}'::jsonb, 1600, NULL, FALSE, TRUE, FALSE),
+
+                ('basic_bowl', 'Обычная миска', 'Предмет кухни: немного замедляет голод.', 'common', 'home_item', 'home', '{"room": "kitchen", "home_bonus": {"hunger_decay": -1}}'::jsonb, 80, 130, TRUE, TRUE, TRUE),
+                ('warm_bed', 'Тёплая лежанка', 'Предмет спальни: питомец лучше отдыхает.', 'uncommon', 'home_item', 'home', '{"room": "bedroom", "home_bonus": {"energy_restore": 2}}'::jsonb, 160, 260, TRUE, TRUE, TRUE),
+                ('scratch_post', 'Когтеточка', 'Предмет игровой: помогает настроению.', 'uncommon', 'home_item', 'home', '{"room": "playroom", "home_bonus": {"mood_decay": -1}}'::jsonb, 150, 250, TRUE, TRUE, TRUE),
+                ('bath_mat', 'Коврик для ванной', 'Предмет ванной: уход проходит спокойнее.', 'common', 'home_item', 'home', '{"room": "bathroom", "home_bonus": {"cleanliness_decay": -1}}'::jsonb, 90, 150, TRUE, TRUE, TRUE),
+                ('yard_lamp', 'Лампа для двора', 'Предмет двора: вечерние игры уютнее.', 'rare', 'home_item', 'home', '{"room": "yard", "home_bonus": {"mood": 2}}'::jsonb, 260, 430, TRUE, TRUE, TRUE),
+                ('premium_bed', 'Премиум-лежанка', 'Эпичный предмет спальни для быстрого отдыха.', 'epic', 'home_item', 'home', '{"room": "bedroom", "home_bonus": {"energy_restore": 5, "health": 1}}'::jsonb, 620, 950, TRUE, TRUE, TRUE),
+                ('smart_feeder', 'Умная кормушка', 'Редкий предмет кухни для стабильной сытости.', 'rare', 'home_item', 'home', '{"room": "kitchen", "home_bonus": {"hunger_decay": -2}}'::jsonb, 360, 580, TRUE, TRUE, TRUE),
+                ('mini_fountain', 'Мини-фонтанчик', 'Предмет кухни: питомец чаще пьёт воду.', 'rare', 'home_item', 'home', '{"room": "kitchen", "home_bonus": {"thirst_decay": -2}}'::jsonb, 330, 540, TRUE, TRUE, TRUE),
+                ('golden_room_set', 'Золотой набор домика', 'Легендарный набор для будущего большого дома.', 'legendary', 'home_item', 'home', '{"room": "all", "home_bonus": {"mood": 5, "health": 2}}'::jsonb, 2200, NULL, FALSE, TRUE, TRUE),
+
+                ('second_pet_license', 'Лицензия на второго питомца', 'Открывает второго питомца при нужном уровне.', 'epic', 'unlock', 'collectible', '{"unlock_pet_slot": 2}'::jsonb, 800, NULL, FALSE, TRUE, FALSE),
+                ('big_home_contract', 'Договор на большой домик', 'Редкий документ для третьего питомца.', 'legendary', 'unlock', 'collectible', '{"unlock_pet_slot": 3}'::jsonb, 1800, NULL, FALSE, TRUE, FALSE),
+                ('bronze_key', 'Бронзовый ключ', 'Открывает бронзовый сундук.', 'rare', 'case_key', 'key', '{"case_key": "bronze"}'::jsonb, 220, NULL, FALSE, TRUE, FALSE),
+                ('silver_key', 'Серебряный ключ', 'Открывает серебряный сундук.', 'epic', 'case_key', 'key', '{"case_key": "silver"}'::jsonb, 520, NULL, FALSE, TRUE, FALSE),
+                ('gold_key', 'Золотой ключ', 'Открывает золотую капсулу.', 'legendary', 'case_key', 'key', '{"case_key": "gold"}'::jsonb, 1200, NULL, FALSE, TRUE, FALSE),
                 ('golden_ticket', 'Золотой билет', 'Коллекционный билет для игровых событий.', 'epic', 'game_ticket', 'collectible', '{}'::jsonb, 350, NULL, FALSE, TRUE, FALSE),
                 ('legend_star', 'Легендарная звезда', 'Редкий предмет для коллекции и торговли.', 'legendary', 'collectible', 'collectible', '{}'::jsonb, 1000, NULL, FALSE, TRUE, FALSE),
-                ('cheap_food', 'Сухой корм', 'Недорогая еда: сытно, но без восторга.', 'common', 'pet_consumable', 'food', '{"hunger": 18, "health": -1, "mood": 1}'::jsonb, 20, 35, TRUE, TRUE, TRUE),
-                ('premium_food', 'Премиум-рагу', 'Качественная еда для здоровья и настроения.', 'rare', 'pet_consumable', 'food', '{"hunger": 35, "health": 4, "mood": 8, "affection": 2}'::jsonb, 140, 210, TRUE, TRUE, TRUE),
-                ('water_bottle', 'Бутылочка воды', 'Восстанавливает жажду питомца.', 'common', 'pet_consumable', 'drink', '{"thirst": 30, "health": 1}'::jsonb, 18, 30, TRUE, TRUE, TRUE),
-                ('berry_soda', 'Ягодная газировка', 'Сладко, бодро, чуть-чуть безумно.', 'uncommon', 'pet_consumable', 'drink', '{"thirst": 20, "mood": 10, "energy": 4}'::jsonb, 55, 90, TRUE, TRUE, TRUE),
-                ('shampoo', 'Пенный шампунь', 'Чистота и приятный запах.', 'uncommon', 'pet_consumable', 'care', '{"cleanliness": 35, "health": 2, "mood": 3}'::jsonb, 70, 110, TRUE, TRUE, TRUE),
-                ('toy_mouse', 'Игрушечная мышь', 'Игрушка для активной игры.', 'common', 'pet_toy', 'toy', '{"mood": 12, "energy": -8, "xp": 10}'::jsonb, 45, 80, TRUE, TRUE, TRUE),
-                ('music_speaker', 'Мини-колонка', 'Включает питомцу музыку и поднимает настроение.', 'rare', 'pet_toy', 'tech', '{"mood": 22, "energy": 3, "xp": 8}'::jsonb, 220, 360, TRUE, TRUE, TRUE),
-                ('red_cap', 'Рыжая кепка', 'Стильная кепка для питомца.', 'uncommon', 'cosmetic', 'clothes', '{}'::jsonb, 95, 150, TRUE, TRUE, FALSE),
-                ('squirrel_hoodie', 'Худи Белочки', 'Мемный образ для самых шумных прогулок.', 'epic', 'cosmetic', 'clothes', '{}'::jsonb, 400, 650, TRUE, TRUE, FALSE),
-                ('season_crown_legend', 'Корона сезона', 'Легендарная награда за первое место в ranked-сезоне.', 'legendary', 'cosmetic', 'clothes', '{}'::jsonb, 1200, NULL, FALSE, TRUE, FALSE),
-                ('season_medal_epic', 'Медаль дуэлянта', 'Эпическая награда за топ-3 ranked-сезона.', 'epic', 'cosmetic', 'clothes', '{}'::jsonb, 650, NULL, FALSE, TRUE, FALSE),
-                ('season_badge_rare', 'Значок рейтинга', 'Редкая награда за топ-10 ranked-сезона.', 'rare', 'cosmetic', 'clothes', '{}'::jsonb, 260, NULL, FALSE, TRUE, FALSE)
+                ('season_crown_legend', 'Корона сезона', 'Легендарная награда за первое место в ranked-сезоне.', 'legendary', 'cosmetic', 'clothes', '{"cosmetic_slot": "head"}'::jsonb, 1200, NULL, FALSE, TRUE, FALSE),
+                ('season_medal_epic', 'Медаль дуэлянта', 'Эпическая награда за топ-3 ranked-сезона.', 'epic', 'cosmetic', 'clothes', '{"cosmetic_slot": "neck"}'::jsonb, 650, NULL, FALSE, TRUE, FALSE),
+                ('season_badge_rare', 'Значок рейтинга', 'Редкая награда за топ-10 ranked-сезона.', 'rare', 'cosmetic', 'clothes', '{"cosmetic_slot": "neck"}'::jsonb, 260, NULL, FALSE, TRUE, FALSE)
             ON CONFLICT (code) DO UPDATE
                 SET name = EXCLUDED.name,
                     description = EXCLUDED.description,
@@ -698,28 +870,34 @@ async def seed_default_content(conn) -> None:
                     sellable = EXCLUDED.sellable,
                     usable = EXCLUDED.usable;
 
-            INSERT INTO cases (code, name, description, price, is_active)
-            VALUES
-                ('starter', 'Стартовый кейс', 'Недорогой кейс с базовыми предметами.', 50, TRUE),
-                ('sweet', 'Сладкий кейс', 'Дороже, но шанс редких предметов выше.', 150, TRUE)
+            INSERT INTO cases (code, name, description, price, required_key_item_id, min_level, sort_order, is_active)
+            SELECT v.code, v.name, v.description, v.price, k.id, v.min_level, v.sort_order, TRUE
+            FROM (VALUES
+                ('starter', 'Стартовый кейс', 'Недорогой кейс с базовыми предметами.', 50, NULL, 1, 10),
+                ('cozy', 'Уютный кейс', 'Еда, уход и предметы для домика.', 120, NULL, 1, 20),
+                ('play', 'Игровой кейс', 'Игрушки, билеты и небольшой шанс ключа.', 220, NULL, 2, 30),
+                ('bronze_chest', 'Бронзовый сундук', 'Улучшенные вещи. Нужен бронзовый ключ.', 0, 'bronze_key', 3, 40),
+                ('silver_chest', 'Серебряный сундук', 'Эпические вещи. Нужен серебряный ключ.', 0, 'silver_key', 6, 50),
+                ('gold_capsule', 'Золотая капсула', 'Лучший лут и легендарные предметы. Нужен золотой ключ.', 0, 'gold_key', 10, 60)
+            ) AS v(code, name, description, price, key_code, min_level, sort_order)
+            LEFT JOIN items k ON k.code = v.key_code
             ON CONFLICT (code) DO UPDATE
                 SET name = EXCLUDED.name,
                     description = EXCLUDED.description,
-                    price = EXCLUDED.price;
+                    price = EXCLUDED.price,
+                    required_key_item_id = EXCLUDED.required_key_item_id,
+                    min_level = EXCLUDED.min_level,
+                    sort_order = EXCLUDED.sort_order;
 
             INSERT INTO case_rewards (case_id, item_id, weight)
             SELECT c.id, i.id, v.weight
             FROM (VALUES
-                ('starter', 'crumb', 45),
-                ('starter', 'ribbon', 30),
-                ('starter', 'ai_cookie', 15),
-                ('starter', 'pet_snack', 8),
-                ('starter', 'golden_ticket', 2),
-                ('sweet', 'ribbon', 35),
-                ('sweet', 'ai_cookie', 25),
-                ('sweet', 'pet_snack', 22),
-                ('sweet', 'golden_ticket', 14),
-                ('sweet', 'legend_star', 4)
+                ('starter', 'crumb', 35), ('starter', 'soft_crumb', 20), ('starter', 'cheap_food', 20), ('starter', 'water_bottle', 15), ('starter', 'ribbon', 8), ('starter', 'ai_cookie', 2),
+                ('cozy', 'soft_towel', 18), ('cozy', 'shampoo', 16), ('cozy', 'basic_bowl', 15), ('cozy', 'warm_bed', 12), ('cozy', 'pet_brush', 12), ('cozy', 'premium_food', 10), ('cozy', 'smart_feeder', 4), ('cozy', 'silver_collar', 3),
+                ('play', 'rubber_ball', 20), ('play', 'toy_mouse', 18), ('play', 'frisbee', 16), ('play', 'pocket_player', 12), ('play', 'laser_pointer', 8), ('play', 'golden_ticket', 6), ('play', 'bronze_key', 5), ('play', 'puzzle_box', 4),
+                ('bronze_chest', 'red_cap', 20), ('bronze_chest', 'fish_bits', 18), ('bronze_chest', 'mini_fountain', 12), ('bronze_chest', 'star_glasses', 10), ('bronze_chest', 'first_aid', 10), ('bronze_chest', 'silver_key', 7), ('bronze_chest', 'raincoat', 6), ('bronze_chest', 'second_pet_license', 3),
+                ('silver_chest', 'royal_cape', 18), ('silver_chest', 'training_tunnel', 16), ('silver_chest', 'spa_foam', 14), ('silver_chest', 'premium_bed', 12), ('silver_chest', 'squirrel_hoodie', 10), ('silver_chest', 'gold_key', 5), ('silver_chest', 'big_home_contract', 3), ('silver_chest', 'legend_star', 2),
+                ('gold_capsule', 'moon_crown', 18), ('gold_capsule', 'sunny_halo', 16), ('gold_capsule', 'golden_room_set', 14), ('gold_capsule', 'big_home_contract', 12), ('gold_capsule', 'legend_star', 10), ('gold_capsule', 'season_crown_legend', 8), ('gold_capsule', 'gold_key', 5), ('gold_capsule', 'chef_plate', 4)
             ) AS v(case_code, item_code, weight)
             JOIN cases c ON c.code = v.case_code
             JOIN items i ON i.code = v.item_code
@@ -753,12 +931,29 @@ async def seed_default_content(conn) -> None:
             INSERT INTO pet_reactions (species, action, mood, text)
             VALUES
                 ('cat', 'feed', 'normal', 'Котик довольно щурится и аккуратно доедает миску.'),
+                ('cat', 'feed', 'happy', 'Котик довольно мурчит и остаётся рядом с миской ещё на минуту.'),
+                ('cat', 'feed', 'sad', 'Котик ест спокойно, но явно ждёт больше внимания.'),
+                ('cat', 'drink', 'normal', 'Котик делает несколько глотков и аккуратно умывается.'),
                 ('cat', 'play', 'happy', 'Котик носится кругами и делает вид, что это всё случайно.'),
+                ('cat', 'wash', 'normal', 'Котик терпит уход с важным видом, зато потом выглядит свежее.'),
+                ('cat', 'sleep', 'normal', 'Котик сворачивается клубком и быстро находит удобное место.'),
+                ('cat', 'heal', 'normal', 'Котик спокойно принимает заботу и чуть увереннее держится.'),
+                ('cat', 'minigame', 'happy', 'Котик ловко просчитывает момент и делает красивый рывок.'),
                 ('dog', 'feed', 'normal', 'Пёсель радостно виляет хвостом и просит добавки.'),
+                ('dog', 'drink', 'normal', 'Пёсель шумно пьёт воду и сразу выглядит бодрее.'),
                 ('dog', 'play', 'happy', 'Пёсель приносит игрушку обратно быстрее, чем ты успел моргнуть.'),
+                ('dog', 'wash', 'normal', 'Пёсель сначала сомневается, но после ухода явно доволен.'),
+                ('dog', 'sleep', 'normal', 'Пёсель укладывается рядом и быстро восстанавливает силы.'),
+                ('dog', 'heal', 'normal', 'Пёсель спокойно даёт помочь и благодарно смотрит.'),
+                ('dog', 'minigame', 'happy', 'Пёсель реагирует мгновенно и честно радуется результату.'),
                 ('squirrel', 'feed', 'normal', 'Белочка хватает еду и смотрит так, будто у неё уже есть план.'),
+                ('squirrel', 'drink', 'normal', 'Белочка быстро пьёт воду и возвращается проверять свои запасы.'),
                 ('squirrel', 'play', 'happy', 'Белочка устраивает маленький хаос, но выглядит счастливой.'),
-                ('squirrel', 'drink', 'happy', 'Белочка делает глоток и заявляет: «ну всё, движ начинается».')
+                ('squirrel', 'wash', 'normal', 'Белочка вертится на месте, но после ухода выглядит аккуратнее.'),
+                ('squirrel', 'sleep', 'normal', 'Белочка прячет хвост удобнее и наконец отдыхает.'),
+                ('squirrel', 'heal', 'normal', 'Белочка принимает помощь и ненадолго становится спокойнее.'),
+                ('squirrel', 'minigame', 'happy', 'Белочка резко меняет маршрут и всё равно успевает первой.'),
+                ('squirrel', 'drink', 'happy', 'Белочка делает глоток и выглядит заметно бодрее.')
             ON CONFLICT (species, action, mood, text) DO NOTHING;
         """)
 

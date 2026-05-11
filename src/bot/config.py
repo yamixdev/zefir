@@ -21,8 +21,11 @@ class Config:
     message_cooldown_sec: int = 3
     market_commission_percent: int = int(os.getenv("MARKET_COMMISSION_PERCENT", "25"))
     game_daily_win_limit: int = int(os.getenv("GAME_DAILY_WIN_LIMIT", "300"))
+    app_timezone: str = os.getenv("APP_TIMEZONE", "Europe/Moscow")
+    shop_rotation_hours: int = int(os.getenv("SHOP_ROTATION_HOURS", "12"))
     ttt_turn_timeout_minutes: int = int(os.getenv("TTT_TURN_TIMEOUT_MINUTES", "15"))
     game_session_timeout_minutes: int = int(os.getenv("GAME_SESSION_TIMEOUT_MINUTES", "30"))
+    stale_game_timeout_minutes: int = int(os.getenv("STALE_GAME_TIMEOUT_MINUTES", "5"))
     ranked_season_days: int = int(os.getenv("RANKED_SEASON_DAYS", "14"))
     ranked_start_elo: int = int(os.getenv("RANKED_START_ELO", "1000"))
     ranked_k_factor: int = int(os.getenv("RANKED_K_FACTOR", "32"))

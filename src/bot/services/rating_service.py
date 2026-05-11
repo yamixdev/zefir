@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from math import pow
 
 from bot.config import config
 from bot.db import get_pool, with_db_retry
+from bot.services.time_service import now_msk
 
 
 async def _active_season(conn) -> dict:
@@ -13,13 +15,15 @@ async def _active_season(conn) -> dict:
     season = await cur.fetchone()
     if season:
         return season
+    start = now_msk()
+    end = start + timedelta(days=config.ranked_season_days)
     cur = await conn.execute(
         """
         INSERT INTO rating_seasons (code, starts_at, ends_at, status)
-        VALUES ('season-' || TO_CHAR(CURRENT_DATE, 'YYYYMMDD'), NOW(), NOW() + make_interval(days => %s), 'active')
+        VALUES (%s, %s, %s, 'active')
         RETURNING *
         """,
-        (config.ranked_season_days,),
+        (f"season-{start:%Y%m%d}", start, end),
     )
     return await cur.fetchone()
 

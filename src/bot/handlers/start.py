@@ -5,6 +5,7 @@ from aiogram.types import Message, CallbackQuery
 
 from bot.config import config
 from bot.keyboards.inline import (
+    banned_main_menu,
     fun_consent_back,
     fun_consent_menu,
     main_menu,
@@ -17,6 +18,7 @@ from bot.models import (
     get_last_menu_msg_id,
     set_last_menu_msg_id,
     get_zefirki_balance,
+    is_banned,
 )
 from bot.services.consent import (
     FUN_CONSENT_EFFECTIVE_TEXT,
@@ -36,6 +38,11 @@ WELCOME_TEXT = (
     "мульти-функциональный помощник с AI, утилитами и мини-играми.\n\n"
     "💰 Твои зефирки: <b>{zefirki}</b>\n\n"
     "Выбери, куда идём:"
+)
+
+BANNED_TEXT = (
+    "🚫 <b>Доступ к функциям бота ограничен.</b>\n\n"
+    "Если считаешь, что это ошибка, можно связаться с владельцем."
 )
 
 CONTACT_TEXT = (
@@ -93,7 +100,7 @@ def _help_text(user_id: int) -> str:
     return _HELP_HEAD + (_HELP_ADMIN if config.is_admin(user_id) else "") + _HELP_TAIL
 
 
-async def _render_fresh_menu(bot: Bot, chat_id: int, user_id: int, text: str) -> None:
+async def _render_fresh_menu(bot: Bot, chat_id: int, user_id: int, text: str, reply_markup=None) -> None:
     """Удаляет ранее отправленное меню и шлёт свежее. Против спама /start."""
     prev_id = await get_last_menu_msg_id(user_id)
     if prev_id:
@@ -101,7 +108,7 @@ async def _render_fresh_menu(bot: Bot, chat_id: int, user_id: int, text: str) ->
             await bot.delete_message(chat_id, prev_id)
         except Exception:
             pass
-    msg = await bot.send_message(chat_id, text, reply_markup=main_menu())
+    msg = await bot.send_message(chat_id, text, reply_markup=reply_markup or main_menu())
     await set_last_menu_msg_id(user_id, msg.message_id)
 
 
@@ -117,6 +124,9 @@ async def cmd_start(message: Message, bot: Bot):
         await message.delete()
     except Exception:
         pass
+    if await is_banned(message.from_user.id) and not config.is_admin(message.from_user.id):
+        await _render_fresh_menu(bot, message.chat.id, message.from_user.id, BANNED_TEXT, banned_main_menu())
+        return
     text = await _welcome_text(message.from_user.id, message.from_user.first_name)
     await _render_fresh_menu(bot, message.chat.id, message.from_user.id, text)
 
@@ -143,6 +153,12 @@ async def cmd_help(message: Message, bot: Bot):
 
 @router.callback_query(F.data == "menu:main")
 async def cb_main_menu(callback: CallbackQuery):
+    if await is_banned(callback.from_user.id) and not config.is_admin(callback.from_user.id):
+        new_msg = await smart_edit(callback, BANNED_TEXT, reply_markup=banned_main_menu())
+        if new_msg:
+            await set_last_menu_msg_id(callback.from_user.id, new_msg.message_id)
+        await callback.answer()
+        return
     text = await _welcome_text(callback.from_user.id, callback.from_user.first_name)
     new_msg = await smart_edit(callback, text, reply_markup=main_menu())
     if new_msg:
@@ -258,8 +274,8 @@ async def _render_after_fun_consent(callback: CallbackQuery, target: str, state:
     elif target == "shop":
         from bot.handlers.shop import _shop_kb, _shop_text
 
-        text, offers = await _shop_text(callback.from_user.id)
-        msg = await smart_edit(callback, text, reply_markup=_shop_kb(offers))
+        text, offers, daily = await _shop_text(callback.from_user.id)
+        msg = await smart_edit(callback, text, reply_markup=_shop_kb(offers, daily))
     elif target == "inventory":
         from bot.handlers.economy import _inventory_kb, item_label
         from bot.services.economy_service import get_inventory
@@ -388,7 +404,7 @@ async def cb_fun_consent_accept(callback: CallbackQuery, state: FSMContext):
     target = _consent_target(callback.data)
     await accept_consent(callback.from_user.id, FUN_CONSENT_VERSION, fun_docs_hash())
     await _render_after_fun_consent(callback, target, state)
-    await callback.answer("Документы приняты")
+    await callback.answer("Соглашение принято")
 
 
 @router.callback_query(F.data == "funconsent:decline")
@@ -397,4 +413,4 @@ async def cb_fun_consent_decline(callback: CallbackQuery):
     new_msg = await smart_edit(callback, text, reply_markup=main_menu())
     if new_msg:
         await set_last_menu_msg_id(callback.from_user.id, new_msg.message_id)
-    await callback.answer("Развлечения закрыты до принятия документов")
+    await callback.answer("Развлечения закрыты до принятия соглашения")

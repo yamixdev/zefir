@@ -1,8 +1,13 @@
 import random
+import logging
 from psycopg.types.json import Jsonb
 
 from bot.config import config
 from bot.db import get_pool, with_db_retry
+from bot.services.time_service import current_shop_rotation, format_msk, next_msk_midnight, today_msk
+
+
+logger = logging.getLogger("зефирка.экономика")
 
 
 RARITY_LABELS = {
@@ -39,7 +44,10 @@ CATEGORY_LABELS = {
     "care": "уход",
     "toy": "игрушки",
     "clothes": "одежда",
+    "accessory": "аксессуары",
     "tech": "техника",
+    "home": "домик",
+    "key": "ключи",
     "collectible": "редкое",
 }
 
@@ -53,6 +61,29 @@ def item_label(item: dict) -> str:
 
 def price_limits_for(item: dict) -> tuple[int, int]:
     return RARITY_PRICE_LIMITS.get(item.get("rarity"), (1, 10000))
+
+
+async def _ensure_shop_rotation(conn) -> dict:
+    rotation = current_shop_rotation()
+    starts_at = rotation["starts_at"]
+    ends_at = rotation["ends_at"]
+    cur = await conn.execute(
+        """
+        INSERT INTO shop_rotations (rotation_key, starts_at, ends_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (rotation_key) DO NOTHING
+        RETURNING rotation_key
+        """,
+        (rotation["key"], starts_at, ends_at),
+    )
+    if await cur.fetchone():
+        logger.info(
+            "🛒 Ротация магазина обновлена: key=%s, start_msk=%s, end_msk=%s",
+            rotation["key"],
+            format_msk(starts_at),
+            format_msk(ends_at),
+        )
+    return rotation
 
 
 async def _add_inventory(conn, user_id: int, item_id: int, quantity: int = 1) -> None:
@@ -222,10 +253,14 @@ async def admin_grant_zefirki(user_id: int, amount: int, reason: str = "admin") 
 async def list_cases(include_inactive: bool = False) -> list[dict]:
     pool = await get_pool()
     async with pool.connection() as conn:
-        sql = "SELECT * FROM cases"
+        sql = """
+            SELECT c.*, i.code AS key_code, i.name AS key_name, i.rarity AS key_rarity
+            FROM cases c
+            LEFT JOIN items i ON i.id = c.required_key_item_id
+        """
         if not include_inactive:
-            sql += " WHERE is_active = TRUE"
-        sql += " ORDER BY price, id"
+            sql += " WHERE c.is_active = TRUE"
+        sql += " ORDER BY c.sort_order, c.price, c.id"
         cur = await conn.execute(sql)
         return await cur.fetchall()
 
@@ -270,7 +305,12 @@ async def open_case(user_id: int, case_id: int) -> dict:
     async with pool.connection() as conn:
         async with conn.transaction():
             cur = await conn.execute(
-                "SELECT * FROM cases WHERE id = %s AND is_active = TRUE",
+                """
+                SELECT c.*, k.code AS key_code, k.name AS key_name
+                FROM cases c
+                LEFT JOIN items k ON k.id = c.required_key_item_id
+                WHERE c.id = %s AND c.is_active = TRUE
+                """,
                 (case_id,),
             )
             case = await cur.fetchone()
@@ -290,23 +330,45 @@ async def open_case(user_id: int, case_id: int) -> dict:
             if not rewards:
                 return {"ok": False, "error": "empty_case", "case": case}
 
-            cur = await conn.execute(
-                """
-                UPDATE users
-                   SET zefirki = zefirki - %s
-                 WHERE user_id = %s AND zefirki >= %s
-                RETURNING zefirki
-                """,
-                (case["price"], user_id, case["price"]),
-            )
-            balance_row = await cur.fetchone()
-            if not balance_row:
-                return {
-                    "ok": False,
-                    "error": "not_enough",
-                    "balance": await _balance_conn(conn, user_id),
-                    "case": case,
-                }
+            if case.get("required_key_item_id"):
+                cur = await conn.execute(
+                    """
+                    UPDATE user_inventory
+                       SET quantity = quantity - 1, updated_at = NOW()
+                     WHERE user_id = %s AND item_id = %s AND quantity > 0
+                    RETURNING quantity
+                    """,
+                    (user_id, case["required_key_item_id"]),
+                )
+                if not await cur.fetchone():
+                    return {
+                        "ok": False,
+                        "error": "no_key",
+                        "balance": await _balance_conn(conn, user_id),
+                        "case": case,
+                    }
+
+            balance_row = None
+            if case["price"] > 0:
+                cur = await conn.execute(
+                    """
+                    UPDATE users
+                       SET zefirki = zefirki - %s
+                     WHERE user_id = %s AND zefirki >= %s
+                    RETURNING zefirki
+                    """,
+                    (case["price"], user_id, case["price"]),
+                )
+                balance_row = await cur.fetchone()
+                if not balance_row:
+                    if case.get("required_key_item_id"):
+                        await _add_inventory(conn, user_id, case["required_key_item_id"], 1)
+                    return {
+                        "ok": False,
+                        "error": "not_enough",
+                        "balance": await _balance_conn(conn, user_id),
+                        "case": case,
+                    }
 
             total = sum(r["weight"] for r in rewards)
             pick = _rng.randint(1, total)
@@ -329,14 +391,18 @@ async def open_case(user_id: int, case_id: int) -> dict:
                 -case["price"],
                 "case_open",
                 item_id=reward["id"],
-                meta={"case_id": case_id, "case": case["code"]},
+                meta={
+                    "case_id": case_id,
+                    "case": case["code"],
+                    "required_key_item_id": case.get("required_key_item_id"),
+                },
             )
 
             return {
                 "ok": True,
                 "case": case,
                 "item": reward,
-                "balance": balance_row["zefirki"],
+                "balance": balance_row["zefirki"] if balance_row else await _balance_conn(conn, user_id),
             }
 
 
@@ -696,6 +762,34 @@ async def use_inventory_item(user_id: int, item_id: int) -> dict:
                     ),
                 )
                 effect = "питомец отреагировал на предмет"
+            elif item["item_type"] == "home_item":
+                room = (effects.get("room") or "kitchen")
+                if room == "all":
+                    room = "playroom"
+                cur = await conn.execute(
+                    """
+                    INSERT INTO pet_homes (user_id)
+                    VALUES (%s)
+                    ON CONFLICT (user_id) DO UPDATE SET updated_at = pet_homes.updated_at
+                    RETURNING user_id
+                    """,
+                    (user_id,),
+                )
+                await cur.fetchone()
+                cur = await conn.execute(
+                    """
+                    INSERT INTO pet_home_items (user_id, room, item_id)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id, room, item_id) DO NOTHING
+                    RETURNING item_id
+                    """,
+                    (user_id, room, item_id),
+                )
+                installed = await cur.fetchone()
+                if not installed:
+                    await _add_inventory(conn, user_id, item_id, 1)
+                    return {"ok": False, "error": "already_installed", "item": item, "room": room}
+                effect = f"предмет установлен в домик: {room}"
             else:
                 effect = "предмет использован"
 
@@ -707,24 +801,32 @@ async def use_inventory_item(user_id: int, item_id: int) -> dict:
 async def list_shop_offers(category: str | None = None, limit: int = 10) -> list[dict]:
     pool = await get_pool()
     async with pool.connection() as conn:
+        rotation = await _ensure_shop_rotation(conn)
         params: list = []
         where = "so.is_active = TRUE AND i.is_active = TRUE"
         if category and category != "all":
             where += " AND i.category = %s"
             params.append(category)
-        params.append(limit)
+        params.extend([rotation["key"], limit])
         cur = await conn.execute(
             f"""
             SELECT so.id AS offer_id, so.price AS offer_price, so.title, so.is_daily, i.*
             FROM shop_offers so
             JOIN items i ON i.id = so.item_id
             WHERE {where}
-            ORDER BY so.is_daily DESC, i.rarity, so.price, so.id
+            ORDER BY md5(%s || ':' || so.id::text)
             LIMIT %s
             """,
             tuple(params),
         )
         return await cur.fetchall()
+
+
+@with_db_retry
+async def get_shop_rotation_status() -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        return await _ensure_shop_rotation(conn)
 
 
 @with_db_retry
@@ -769,17 +871,18 @@ async def buy_shop_offer(user_id: int, offer_id: int) -> dict:
 
 @with_db_retry
 async def claim_daily_freebie(user_id: int) -> dict:
+    claim_date = today_msk()
     pool = await get_pool()
     async with pool.connection() as conn:
         async with conn.transaction():
             cur = await conn.execute(
                 """
-                INSERT INTO daily_claims (user_id, amount)
-                VALUES (%s, 0)
+                INSERT INTO daily_claims (user_id, claim_date, amount)
+                VALUES (%s, %s, 0)
                 ON CONFLICT (user_id, claim_date) DO NOTHING
                 RETURNING user_id
                 """,
-                (user_id,),
+                (user_id, claim_date),
             )
             if not await cur.fetchone():
                 return {"ok": False, "error": "already_claimed"}
@@ -802,11 +905,34 @@ async def claim_daily_freebie(user_id: int) -> dict:
             if item:
                 await _add_inventory(conn, user_id, item["id"], 1)
             await conn.execute(
-                "UPDATE daily_claims SET amount = %s, item_id = %s WHERE user_id = %s AND claim_date = CURRENT_DATE",
-                (amount, item["id"] if item else None, user_id),
+                "UPDATE daily_claims SET amount = %s, item_id = %s WHERE user_id = %s AND claim_date = %s",
+                (amount, item["id"] if item else None, user_id, claim_date),
             )
             await _log_event(conn, user_id, amount, "daily_claim", item_id=item["id"] if item else None)
+            logger.info("🎁 Daily получен: user_id=%s, date_msk=%s, amount=%s", user_id, claim_date, amount)
             return {"ok": True, "amount": amount, "item": item}
+
+
+@with_db_retry
+async def get_daily_freebie_status(user_id: int) -> dict:
+    claim_date = today_msk()
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT dc.*, i.name, i.rarity, i.item_type, i.category
+            FROM daily_claims dc
+            LEFT JOIN items i ON i.id = dc.item_id
+            WHERE dc.user_id = %s AND dc.claim_date = %s
+            """,
+            (user_id, claim_date),
+        )
+        claim = await cur.fetchone()
+        return {
+            "available": claim is None,
+            "claim": claim,
+            "next_claim_at": next_msk_midnight(),
+        }
 
 
 @with_db_retry

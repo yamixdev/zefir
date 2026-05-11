@@ -1,6 +1,8 @@
 import logging
+import html
 
 from aiogram import Router, F, Bot
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -13,13 +15,17 @@ from bot.keyboards.inline import (
     admin_menu, admin_tickets_list, admin_ticket_actions,
     admin_users_list, admin_user_actions, confirm_action, main_menu,
     grant_user_list, grant_comment_choice, grant_cancel_kb,
+    admin_ban_reasons, admin_incidents_list, admin_incident_actions,
+    incident_user_close,
 )
+from bot.services.time_service import format_msk
 from bot.models import (
     get_open_tickets, count_open_tickets, get_ticket, update_ticket_status,
     set_ticket_reply, get_all_users, get_user, set_ban,
     reset_ai_limits_all, reset_ai_limit_user, get_stats, get_users_count,
     mark_ticket_seen, get_last_menu_msg_id, set_last_menu_msg_id,
-    grant_ai_bonus,
+    grant_ai_bonus, get_online_users, get_user_activity, mark_bot_blocked,
+    list_incidents, get_incident, close_incident,
 )
 from bot.utils import tg_safe
 
@@ -33,6 +39,15 @@ class AdminStates(StatesGroup):
     waiting_broadcast = State()
     waiting_grant_amount = State()
     waiting_grant_comment = State()
+    waiting_ban_reason = State()
+    waiting_incident_note = State()
+
+
+BAN_REASONS = {
+    "spam": "Спам / флуд",
+    "abuse": "Абуз экономики или игровых механик",
+    "toxicity": "Оскорбления или токсичное поведение",
+}
 
 
 # ── Admin command ────────────────────────────────────────────────
@@ -191,7 +206,7 @@ async def cb_ticket_detail(callback: CallbackQuery):
         f"👤 <b>{name}</b> (@{username})\n"
         f"🆔 <code>{ticket['user_id']}</code>\n"
         f"📌 {status_map.get(ticket['status'], ticket['status'])}\n"
-        f"📅 {ticket['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"📅 {format_msk(ticket['created_at'])} МСК\n\n"
         f"💬 <b>Сообщение:</b>\n<i>{ticket['message']}</i>"
     )
     if ticket["ai_summary"]:
@@ -393,6 +408,14 @@ def _user_profile_text(user: dict) -> str:
     ban_status = "🔴 Заблокирован" if user["is_banned"] else "🟢 Активен"
     bonus = user.get("ai_bonus") or 0
     bonus_line = f"🎁 AI-бонус: <b>+{bonus}</b>\n" if bonus else ""
+    link = f'<a href="tg://user?id={user["user_id"]}">Открыть профиль Telegram</a>'
+    blocked = user.get("bot_blocked_at")
+    blocked_line = f"\n🚫 Бот в ЧС: <b>{format_msk(blocked)}</b> МСК" if blocked else ""
+    active = user.get("last_active_at")
+    active_line = f"\n🟢 Последняя активность: <b>{format_msk(active)}</b> МСК" if active else ""
+    reason_line = ""
+    if user["is_banned"] and user.get("ban_reason_text"):
+        reason_line = f"\nПричина: <i>{html.escape(user['ban_reason_text'])}</i>"
     return (
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "      👤 <b>ПРОФИЛЬ</b>\n"
@@ -400,10 +423,11 @@ def _user_profile_text(user: dict) -> str:
         f"👤 <b>{name}</b>\n"
         f"🔖 @{user['username'] or '—'}\n"
         f"🆔 <code>{user['user_id']}</code>\n\n"
-        f"📌 Статус: {ban_status}\n"
+        f"🔗 {link}\n"
+        f"📌 Статус: {ban_status}{reason_line}{active_line}{blocked_line}\n"
         f"🤖 AI использовано: <b>{user['ai_messages_used']}</b> из <b>{config.ai_daily_limit}</b>\n"
         f"{bonus_line}"
-        f"📅 Регистрация: {user['created_at'].strftime('%d.%m.%Y')}"
+        f"📅 Регистрация: {format_msk(user['created_at'], '%d.%m.%Y')}"
     )
 
 
@@ -431,19 +455,80 @@ async def cb_user_detail(callback: CallbackQuery):
 
 # ── Ban / Unban ──────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("adm:ban:"))
-async def cb_ban(callback: CallbackQuery):
+@router.callback_query(F.data.startswith("adm:ban_menu:"))
+async def cb_ban_menu(callback: CallbackQuery):
     if not config.is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     user_id = int(callback.data.split(":")[2])
-    await set_ban(user_id, True)
+    await callback.message.edit_text(
+        "🚫 <b>Бан пользователя</b>\n\nВыбери причину. Она сохранится в профиле пользователя.",
+        reply_markup=admin_ban_reasons(user_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:ban_reason:"))
+async def cb_ban_reason(callback: CallbackQuery, state: FSMContext):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    _, _, user_id_raw, reason_code = callback.data.split(":", 3)
+    user_id = int(user_id_raw)
+    reason_text = BAN_REASONS.get(reason_code, reason_code)
+    await state.clear()
+    await set_ban(user_id, True, reason_code=reason_code, reason_text=reason_text, banned_by=callback.from_user.id)
     await callback.answer("🚫 Пользователь забанен", show_alert=True)
     user = await get_user(user_id)
     if user:
         try:
             await callback.message.edit_text(
                 _user_profile_text(user),
+                reply_markup=admin_user_actions(user_id, True),
+            )
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("adm:ban_custom:"))
+async def cb_ban_custom(callback: CallbackQuery, state: FSMContext):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    user_id = int(callback.data.split(":")[2])
+    await state.set_state(AdminStates.waiting_ban_reason)
+    await state.update_data(ban_user_id=user_id, ban_prompt_msg_id=callback.message.message_id)
+    await callback.message.edit_text(
+        "✍️ <b>Своя причина бана</b>\n\nНапиши короткую причину для админ-журнала:",
+        reply_markup=admin_ban_reasons(user_id),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_ban_reason)
+async def process_custom_ban_reason(message: Message, state: FSMContext, bot: Bot):
+    if not config.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    user_id = int(data.get("ban_user_id") or 0)
+    prompt_msg_id = data.get("ban_prompt_msg_id")
+    reason = (message.text or "").strip()[:300] or "Своя причина"
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if not user_id:
+        return
+    await set_ban(user_id, True, reason_code="custom", reason_text=reason, banned_by=message.from_user.id)
+    user = await get_user(user_id)
+    if prompt_msg_id and user:
+        try:
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=prompt_msg_id,
+                text=_user_profile_text(user),
                 reply_markup=admin_user_actions(user_id, True),
             )
         except Exception:
@@ -467,6 +552,162 @@ async def cb_unban(callback: CallbackQuery):
             )
         except Exception:
             pass
+
+
+@router.callback_query(F.data == "adm:online")
+async def cb_admin_online(callback: CallbackQuery):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    users = await get_online_users(minutes=15, limit=30)
+    lines = ["🟢 <b>Сейчас онлайн</b>\n", "Активность за последние 15 минут.\n"]
+    if not users:
+        lines.append("Сейчас активных пользователей нет.")
+    for user in users:
+        name = user.get("first_name") or user.get("username") or str(user["user_id"])
+        at = format_msk(user["last_active_at"], "%H:%M") if user.get("last_active_at") else "—"
+        action = html.escape(user.get("last_action") or "—")
+        blocked = " · ЧС" if user.get("bot_blocked_at") else ""
+        lines.append(f"• <a href=\"tg://user?id={user['user_id']}\">{html.escape(name)}</a> · {at} · {action}{blocked}")
+    await callback.message.edit_text("\n".join(lines), reply_markup=admin_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:activity:"))
+async def cb_admin_activity(callback: CallbackQuery):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    user_id = int(callback.data.split(":")[2])
+    events = await get_user_activity(user_id, limit=20)
+    lines = [f"🧾 <b>Действия пользователя</b>\n\n🆔 <code>{user_id}</code>\n"]
+    if not events:
+        lines.append("Журнала действий пока нет.")
+    for event in events:
+        at = format_msk(event["created_at"], "%d.%m %H:%M")
+        lines.append(f"• {at} · {html.escape(event['event_type'])} · {html.escape(event['action'])}")
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=admin_user_actions(user_id, (await get_user(user_id))["is_banned"]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:probe:"))
+async def cb_probe_user(callback: CallbackQuery, bot: Bot):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    user_id = int(callback.data.split(":")[2])
+    try:
+        msg = await bot.send_message(user_id, ".")
+        try:
+            await bot.delete_message(user_id, msg.message_id)
+        except TelegramBadRequest:
+            pass
+        await mark_bot_blocked(user_id, False)
+        await callback.answer("Сообщение доставилось, бот не в ЧС.", show_alert=True)
+    except TelegramForbiddenError:
+        await mark_bot_blocked(user_id, True)
+        await callback.answer("Пользователь заблокировал бота или недоступен.", show_alert=True)
+    except Exception as e:
+        await callback.answer(f"Не удалось проверить: {e.__class__.__name__}", show_alert=True)
+    user = await get_user(user_id)
+    if user:
+        await callback.message.edit_text(_user_profile_text(user), reply_markup=admin_user_actions(user_id, user["is_banned"]))
+
+
+@router.callback_query(F.data.regexp(r"^adm:incidents(:\d+)?$"))
+async def cb_incidents(callback: CallbackQuery):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    page = int(parts[2]) if len(parts) > 2 else 0
+    incidents = await list_incidents(status="open", limit=10, offset=page * 10)
+    text = "🚨 <b>Инциденты</b>\n\n"
+    text += "Открытых инцидентов нет." if not incidents else f"Открытые ошибки и баг-репорты · стр. {page + 1}"
+    await callback.message.edit_text(text, reply_markup=admin_incidents_list(incidents, page))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:incident:"))
+async def cb_incident_detail(callback: CallbackQuery):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    incident_id = int(callback.data.split(":")[2])
+    incident = await get_incident(incident_id)
+    if not incident:
+        await callback.answer("Инцидент не найден", show_alert=True)
+        return
+    user_line = "—"
+    if incident.get("user_id"):
+        name = incident.get("first_name") or incident.get("username") or str(incident["user_id"])
+        user_line = f'<a href="tg://user?id={incident["user_id"]}">{html.escape(name)}</a> · <code>{incident["user_id"]}</code>'
+    tb = (incident.get("traceback_text") or "").strip()
+    if len(tb) > 1400:
+        tb = tb[:1400] + "\n..."
+    text = (
+        f"🚨 <b>Инцидент #{incident['id']}</b>\n\n"
+        f"Статус: <b>{html.escape(incident['status'])}</b>\n"
+        f"Тип: <b>{html.escape(incident['event_type'])}</b>\n"
+        f"Пользователь: {user_line}\n"
+        f"Действие: <code>{html.escape(incident.get('action') or '—')}</code>\n"
+        f"Дата: <b>{format_msk(incident['created_at'])}</b> МСК\n\n"
+        f"<b>{html.escape(incident['title'])}</b>\n"
+        f"{html.escape(incident.get('message') or '')}"
+    )
+    if tb:
+        text += f"\n\n<pre>{html.escape(tb)}</pre>"
+    await callback.message.edit_text(text, reply_markup=admin_incident_actions(incident_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:incident_close:"))
+async def cb_incident_close_start(callback: CallbackQuery, state: FSMContext):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    _, _, incident_id, status = callback.data.split(":")
+    await state.set_state(AdminStates.waiting_incident_note)
+    await state.update_data(incident_id=int(incident_id), incident_status=status, incident_msg_id=callback.message.message_id)
+    await callback.message.edit_text(
+        "✍️ <b>Закрытие инцидента</b>\n\n"
+        "Напиши короткий комментарий. Если комментарий не нужен, отправь точку.",
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_incident_note)
+async def process_incident_note(message: Message, state: FSMContext, bot: Bot):
+    if not config.is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    await state.clear()
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    incident_id = int(data.get("incident_id") or 0)
+    status_raw = data.get("incident_status") or "fixed"
+    status = "fixed" if status_raw == "fixed" else "wontfix"
+    note = (message.text or "").strip()
+    if note == ".":
+        note = ""
+    incident = await close_incident(incident_id, status, note, message.from_user.id)
+    if incident and incident.get("user_id"):
+        label = "исправлен" if status == "fixed" else "закрыт"
+        user_text = (
+            f"🛠 <b>Инцидент #{incident_id} {label}</b>\n\n"
+            f"{html.escape(note) if note else 'Спасибо, что помог найти проблему.'}"
+        )
+        try:
+            await bot.send_message(incident["user_id"], user_text, reply_markup=incident_user_close())
+        except Exception:
+            pass
+    await message.answer(f"✅ Инцидент #{incident_id} закрыт.", reply_markup=admin_menu())
 
 
 # ── Reset AI limits ──────────────────────────────────────────────

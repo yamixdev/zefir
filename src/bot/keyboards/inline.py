@@ -12,10 +12,17 @@ def main_menu() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def banned_main_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="📨 Связаться с владельцем", callback_data="menu:contact"))
+    return kb.as_markup()
+
+
 def contact_submenu() -> InlineKeyboardMarkup:
     """Подменю «Связаться с владельцем»."""
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="✉️ Написать владельцу", callback_data="ticket:new"))
+    kb.row(InlineKeyboardButton(text="🛠 Сообщить о баге", callback_data="incident:report"))
     kb.row(InlineKeyboardButton(text="📊 Мои тикеты", callback_data="ticket:my"))
     kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
     return kb.as_markup()
@@ -57,8 +64,8 @@ def utilities_submenu() -> InlineKeyboardMarkup:
 
 def fun_consent_menu(target: str = "fun") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📜 Правила", callback_data=f"funconsent:tos:{target}")],
-        [InlineKeyboardButton(text="🔒 Данные", callback_data=f"funconsent:privacy:{target}")],
+        [InlineKeyboardButton(text="📜 Пользовательское соглашение", callback_data=f"funconsent:tos:{target}")],
+        [InlineKeyboardButton(text="🔒 Политика конфиденциальности", callback_data=f"funconsent:privacy:{target}")],
         [
             InlineKeyboardButton(text="✅ Принимаю", callback_data=f"funconsent:accept:{target}"),
             InlineKeyboardButton(text="❌ Отказаться", callback_data="funconsent:decline"),
@@ -224,6 +231,10 @@ def admin_menu() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast"),
         InlineKeyboardButton(text="👑 Мой профиль", callback_data="profile:admin"),
     )
+    kb.row(
+        InlineKeyboardButton(text="🟢 Онлайн", callback_data="adm:online"),
+        InlineKeyboardButton(text="🚨 Инциденты", callback_data="adm:incidents"),
+    )
     kb.row(InlineKeyboardButton(text="📰 Новости", callback_data="adm:news"))
     kb.row(InlineKeyboardButton(text="🍬 Экономика", callback_data="adm:econ"))
     kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
@@ -284,12 +295,60 @@ def admin_user_actions(user_id: int, is_banned: bool) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🎁 Начислить AI", callback_data=f"adm:grant_pick:{user_id}"),
         InlineKeyboardButton(text="🔄 Сбросить AI", callback_data=f"adm:resetlim:{user_id}"),
     )
+    kb.row(
+        InlineKeyboardButton(text="🧾 Действия", callback_data=f"adm:activity:{user_id}"),
+        InlineKeyboardButton(text="📡 Проверить ЧС", callback_data=f"adm:probe:{user_id}"),
+    )
     if is_banned:
         kb.row(InlineKeyboardButton(text="✅ Разбанить", callback_data=f"adm:unban:{user_id}"))
     else:
-        kb.row(InlineKeyboardButton(text="🚫 Забанить", callback_data=f"adm:ban:{user_id}"))
+        kb.row(InlineKeyboardButton(text="🚫 Забанить", callback_data=f"adm:ban_menu:{user_id}"))
     kb.row(InlineKeyboardButton(text="⬅️ К пользователям", callback_data="adm:users"))
     return kb.as_markup()
+
+
+def admin_ban_reasons(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 · Спам / флуд", callback_data=f"adm:ban_reason:{user_id}:spam")],
+        [InlineKeyboardButton(text="2 · Абуз экономики", callback_data=f"adm:ban_reason:{user_id}:abuse")],
+        [InlineKeyboardButton(text="3 · Оскорбления / токсичность", callback_data=f"adm:ban_reason:{user_id}:toxicity")],
+        [InlineKeyboardButton(text="✍️ Своя причина", callback_data=f"adm:ban_custom:{user_id}")],
+        [InlineKeyboardButton(text="⬅️ К пользователю", callback_data=f"adm:user:{user_id}")],
+    ])
+
+
+def admin_incidents_list(incidents: list, page: int = 0) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for incident in incidents:
+        kb.row(InlineKeyboardButton(
+            text=f"#{incident['id']} · {incident['title'][:34]}",
+            callback_data=f"adm:incident:{incident['id']}",
+        ))
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm:incidents:{page - 1}"))
+    if len(incidents) >= 10:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm:incidents:{page + 1}"))
+    if nav:
+        kb.row(*nav)
+    kb.row(InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:menu"))
+    return kb.as_markup()
+
+
+def admin_incident_actions(incident_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="✅ Исправлено", callback_data=f"adm:incident_close:{incident_id}:fixed"),
+        InlineKeyboardButton(text="⚫ Не исправлено", callback_data=f"adm:incident_close:{incident_id}:wontfix"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅️ Инциденты", callback_data="adm:incidents"))
+    return kb.as_markup()
+
+
+def incident_user_close() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Закрыть", callback_data="incident:user_close")]
+    ])
 
 
 # ── Grant AI limit flow ─────────────────────────────────────────
