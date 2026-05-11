@@ -14,12 +14,14 @@ from bot.config import config
 from bot.services.games_service import (
     MS_SIZE,
     cancel_ttt_room,
+    cashout_minesweeper,
     create_ttt_room,
     join_ttt_room,
     expire_stale_ttt_rooms,
     list_user_active_games,
     list_waiting_ttt_rooms,
     minesweeper_cell_text,
+    minesweeper_summary,
     open_minesweeper_cell,
     play_dice,
     play_guess_number,
@@ -34,7 +36,9 @@ from bot.services.game_logic import (
     guess_hangman_letter,
     hand_value,
     is_blackjack,
+    mines_cashout,
     mines_cell_label,
+    mines_multiplier,
     mines_open,
     render_hangman_word,
     rps_winner,
@@ -45,6 +49,7 @@ from bot.services.game_logic import (
 from bot.services.game_session_service import (
     add_chat_message,
     activate_due_duel_signals,
+    activate_due_mines_starts,
     cancel_session,
     create_session,
     display_name,
@@ -57,10 +62,11 @@ from bot.services.game_session_service import (
     load_quiz_questions,
     list_my_sessions,
     list_open_sessions,
+    replay_mines_session,
     set_session_message,
     start_session,
 )
-from bot.services.rating_service import claim_season_reward, get_ranked_leaderboard
+from bot.services.rating_service import claim_season_reward, get_ranked_leaderboard, season_rewards_available
 from bot.services.time_service import format_msk
 from bot.utils import render_clean_message, smart_edit
 
@@ -242,6 +248,17 @@ def _bot_blackjack_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _bot_mines_count_kb(stake: int) -> InlineKeyboardMarkup:
+    rows = []
+    for start in (2, 5, 8):
+        rows.append([
+            InlineKeyboardButton(text=f"{n} мин", callback_data=f"games:botrun:ms:{stake}:{n}")
+            for n in range(start, min(start + 3, 11))
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Ставка", callback_data="games:bot:ms")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.callback_query(F.data == "games:home")
 async def cb_games_home(callback: CallbackQuery):
     text = (
@@ -309,19 +326,27 @@ async def cb_bot_pick(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("games:botrun:"))
 async def cb_bot_run(callback: CallbackQuery):
-    _, _, kind, stake_raw = callback.data.split(":")
+    parts = callback.data.split(":")
+    _, _, kind, stake_raw = parts[:4]
     stake = int(stake_raw)
     if kind == "ms":
-        result = await start_minesweeper(callback.from_user.id, stake)
+        if stake > 0 and len(parts) == 4:
+            await smart_edit(
+                callback,
+                "💣 <b>Сапёр со ставкой</b>\n\n"
+                f"Ставка: <b>{_money(stake)}</b> 🍬\n"
+                "Выбери количество мин. Чем больше мин, тем выше иксы и риск.",
+                reply_markup=_bot_mines_count_kb(stake),
+            )
+            await callback.answer()
+            return
+        mines_count = int(parts[4]) if len(parts) > 4 else 3
+        result = await start_minesweeper(callback.from_user.id, stake, mines_count)
         if not result["ok"]:
             await callback.answer("Не хватает зефирок для ставки.", show_alert=True)
             return
         game = result["game"]
-        text = (
-            "💣 <b>Сапёр</b>\n\n"
-            f"Ставка: <b>{_money(game['stake'])}</b> 🍬\n"
-            "Поле 4x4, внутри 3 мины. Открой все безопасные клетки."
-        )
+        text = _ms_text(game)
         await smart_edit(callback, text, reply_markup=_ms_kb(game))
     elif kind == "dice":
         result = await play_dice(callback.from_user.id, stake)
@@ -511,10 +536,13 @@ async def cb_games_rating(callback: CallbackQuery):
             f"{row['place']}. <b>{html.escape(name)}</b> — <b>{row['elo']}</b> ELO "
             f"({row['wins']}/{row['losses']}/{row['draws']})"
         )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 Забрать награду сезона", callback_data="games:rating:claim")],
-        [InlineKeyboardButton(text="⬅️ Игры", callback_data="games:home")],
-    ])
+    rows = []
+    if season_rewards_available(season):
+        rows.append([InlineKeyboardButton(text="🎁 Забрать награду сезона", callback_data="games:rating:claim")])
+    else:
+        lines.append("\nНаграды откроются после окончания сезона или ручного подведения итогов.")
+    rows.append([InlineKeyboardButton(text="⬅️ Игры", callback_data="games:home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await smart_edit(callback, "\n".join(lines), reply_markup=kb)
     await callback.answer()
 
@@ -525,6 +553,7 @@ async def cb_games_rating_claim(callback: CallbackQuery):
     if not result["ok"]:
         errors = {
             "no_finished_season": "Сезон ещё не закончился.",
+            "season_active": "Сезон ещё идёт, награда будет доступна после итогов.",
             "not_eligible": "Нужно сыграть минимум 3 ranked-игры за сезон.",
             "already_claimed": "Ты уже забрал награду за этот сезон.",
         }
@@ -799,14 +828,45 @@ def _session_text(session: dict, viewer_id: int) -> str:
             player = _session_player(session, session["current_turn_id"])
             text += f"\nХодит: <b>{html.escape(display_name(player)) if player else session['current_turn_id']}</b>"
     elif session["game_type"] == "mines":
+        if state.get("phase") == "preparing":
+            text += (
+                "Зефир подбирает поле и количество мин...\n"
+                "Через несколько секунд доска станет активной."
+            )
+            text += _chat_text(session)
+            return text
         board = (state.get("boards") or {}).get(str(viewer_id))
         if board:
             size = int(board.get("size") or 4)
             reveal = board.get("status") in ("lost", "won") or session["status"] != "running"
+            summary = board.get("summary") or _board_summary_for_ui(board, session["stake"])
+            mines_count = int(board.get("mines_count") or len(board.get("mines") or []) or state.get("mines_count") or 3)
+            opened = len(board.get("revealed") or [])
+            status_label = {
+                "active": "играешь",
+                "cashed_out": "забрал выигрыш",
+                "lost": "попал на мину",
+                "won": "очистил поле",
+            }.get(board.get("status"), board.get("status") or "игра")
+            text += (
+                f"Мины: <b>{mines_count}</b>\n"
+                f"Статус: <b>{status_label}</b>\n"
+                f"Открыто: <b>{opened}/{size * size - mines_count}</b>\n"
+            )
+            if session["stake"] > 0 and board.get("status") == "active":
+                current = int(summary.get("current_payout") or 0)
+                next_payout = int(summary.get("next_payout") or 0)
+                next_mult = float(summary.get("next_multiplier") or 0)
+                text += (
+                    f"Текущий cashout: <b>{_money(current)}</b> 🍬\n"
+                    f"Следующая клетка: <b>{_money(next_payout)}</b> 🍬 ({_fmt_multiplier(next_mult)})\n"
+                )
+            elif board.get("status") == "cashed_out":
+                text += f"Забрано: <b>{_money(int(board.get('payout') or 0))}</b> 🍬\n"
             text += "Твоё поле:\n"
             for r in range(size):
                 text += " ".join(mines_cell_label(board, r * size + c, reveal) for c in range(size)) + "\n"
-            text += "\nПервый, кто очистит поле, побеждает. Мина — поражение."
+            text += "\nМожно забрать cashout или рискнуть дальше. Мина сжигает ставку."
     text += _chat_text(session)
     return text
 
@@ -823,7 +883,11 @@ def _session_kb(session: dict, viewer_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="⬅️ Игры", callback_data="games:home")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
     if session["status"] != "running":
-        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎮 Игры", callback_data="games:home")]])
+        rows = []
+        if session["game_type"] == "mines" and session["status"] in ("finished", "draw"):
+            rows.append([InlineKeyboardButton(text="🔁 Ещё раз", callback_data=f"game:{session['id']}:replay:x")])
+        rows.append([InlineKeyboardButton(text="🎮 Игры", callback_data="games:home")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     rows = []
     state = session.get("state") or {}
@@ -872,14 +936,19 @@ def _session_kb(session: dict, viewer_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✋ Стоп", callback_data=f"game:{session['id']}:bj:stand"),
             ])
     elif game_type == "mines":
-        board = (state.get("boards") or {}).get(str(viewer_id))
-        if board and board.get("status") == "active":
-            size = int(board.get("size") or 4)
-            for r in range(size):
-                rows.append([
-                    InlineKeyboardButton(text=mines_cell_label(board, r * size + c), callback_data=f"game:{session['id']}:mine:{r * size + c}")
-                    for c in range(size)
-                ])
+        if state.get("phase") == "preparing":
+            rows.append([InlineKeyboardButton(text="⏳ Подождать", callback_data=f"game:{session['id']}:noop:x")])
+        else:
+            board = (state.get("boards") or {}).get(str(viewer_id))
+            if board and board.get("status") == "active":
+                size = int(board.get("size") or 4)
+                for r in range(size):
+                    rows.append([
+                        InlineKeyboardButton(text=mines_cell_label(board, r * size + c), callback_data=f"game:{session['id']}:mine:{r * size + c}")
+                        for c in range(size)
+                    ])
+                if session["stake"] > 0 and len(board.get("revealed") or []) > 0:
+                    rows.append([InlineKeyboardButton(text="💰 Забрать", callback_data=f"game:{session['id']}:mine:cashout")])
     if session.get("mode") != "bot":
         rows.append([InlineKeyboardButton(text="💬 Сообщение", callback_data=f"game:{session['id']}:chat:x")])
     rows.append([InlineKeyboardButton(text="🎮 Игры", callback_data="games:home")])
@@ -934,9 +1003,10 @@ async def _finish_and_sync(callback: CallbackQuery, session_id: str, winner_id: 
 
 async def process_due_game_events(bot: Bot, limit: int = 20) -> dict:
     sessions = await activate_due_duel_signals(limit=limit)
+    mines_sessions = await activate_due_mines_starts(limit=limit)
     expired_sessions = await expire_stale_sessions(limit=50)
     expired_rooms = await expire_stale_ttt_rooms(limit=50)
-    for session in [*sessions, *expired_sessions]:
+    for session in [*sessions, *mines_sessions, *expired_sessions]:
         await _sync_session_messages(bot, session)
     for room in expired_rooms:
         if room.get("creator_id"):
@@ -945,6 +1015,7 @@ async def process_due_game_events(bot: Bot, limit: int = 20) -> dict:
             await _sync_ttt_player(bot, room, room["opponent_id"])
     return {
         "duel_signals": len(sessions),
+        "mines_starts": len(mines_sessions),
         "expired_sessions": len(expired_sessions),
         "expired_rooms": len(expired_rooms),
     }
@@ -1115,6 +1186,20 @@ async def cb_session_noop(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router.callback_query(F.data.regexp(r"^game:[a-z0-9]{5,10}:replay:"))
+async def cb_session_replay(callback: CallbackQuery):
+    session_id = callback.data.split(":")[1]
+    result = await replay_mines_session(session_id, callback.from_user.id)
+    session = result.get("session")
+    if session:
+        await _sync_session_messages(callback.bot, session)
+        await smart_edit(callback, _session_text(session, callback.from_user.id), reply_markup=_session_kb(session, callback.from_user.id))
+    if not result["ok"]:
+        await callback.answer("Не удалось начать заново: не хватает зефирок или матч уже закрыт.", show_alert=True)
+        return
+    await callback.answer("Ждём второго игрока" if result.get("waiting") else "Новый раунд начинается")
+
+
 @router.message(GameStates.waiting_game_message)
 async def msg_game_chat(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
@@ -1141,6 +1226,64 @@ async def msg_game_chat(message: Message, state: FSMContext, bot: Bot):
         await _sync_session_messages(bot, session)
 
 
+def _fmt_multiplier(value: float) -> str:
+    return f"x{value:.2f}".replace(".", ",")
+
+
+def _board_summary_for_ui(board: dict, stake: int) -> dict:
+    mines_count = int(board.get("mines_count") or len(board.get("mines") or []) or 3)
+    opened = len(board.get("revealed") or [])
+    safe_total = MS_SIZE * MS_SIZE - mines_count
+    current_multiplier = mines_multiplier(MS_SIZE, mines_count, opened, config.mines_rtp) if stake > 0 and opened > 0 else 0
+    next_multiplier = mines_multiplier(MS_SIZE, mines_count, min(opened + 1, safe_total), config.mines_rtp) if stake > 0 and opened < safe_total else current_multiplier
+    return {
+        "current_payout": mines_cashout(stake, current_multiplier),
+        "next_payout": mines_cashout(stake, next_multiplier),
+        "next_multiplier": next_multiplier,
+    }
+
+
+def _ms_text(game: dict, state: dict | None = None, status: str = "active", result: dict | None = None) -> str:
+    state = state or game["state"]
+    summary = result.get("summary") if result else None
+    summary = summary or minesweeper_summary(game, state)
+    stake = int(summary["stake"])
+    lines = [
+        "💣 <b>Сапёр</b>",
+        "",
+        f"Ставка: <b>{_money(stake)}</b> 🍬",
+        f"Мины: <b>{summary['mines_count']}</b>",
+        f"Открыто: <b>{summary['opened']}/{summary['safe_total']}</b>",
+    ]
+    if stake > 0 and status == "active":
+        lines.extend([
+            f"Текущий cashout: <b>{_money(summary['current_payout'])}</b> 🍬 ({_fmt_multiplier(summary['current_multiplier']) if summary['opened'] else 'ещё нет'})",
+            f"Следующая клетка: <b>{_money(summary['next_payout'])}</b> 🍬 ({_fmt_multiplier(summary['next_multiplier'])})",
+        ])
+    elif stake == 0:
+        lines.append("Режим без ставки: зефирки не начисляются.")
+    if status == "lost":
+        lines.extend([
+            "",
+            "💥 <b>Мина.</b>",
+            f"Потеря: <b>-{_money(stake)}</b> 🍬",
+            f"Баланс: <b>{_money(result.get('balance', 0) if result else 0)}</b> 🍬",
+        ])
+    elif status in ("won", "cashed_out", "cancelled"):
+        payout = int(result.get("payout") or 0) if result else 0
+        delta = int(result.get("delta") or payout - stake) if result else 0
+        sign = "+" if delta > 0 else ""
+        label = "Cashout" if status == "cashed_out" else "Игра закрыта" if status == "cancelled" else "Поле очищено"
+        lines.extend([
+            "",
+            f"🏁 <b>{label}</b>",
+            f"Выплата: <b>{_money(payout)}</b> 🍬",
+            f"Итог: <b>{sign}{_money(delta)}</b> 🍬",
+            f"Баланс: <b>{_money(result.get('balance', 0) if result else 0)}</b> 🍬",
+        ])
+    return "\n".join(lines)
+
+
 def _ms_kb(game: dict, reveal_all: bool = False) -> InlineKeyboardMarkup:
     state = game["state"]
     rows = []
@@ -1153,6 +1296,12 @@ def _ms_kb(game: dict, reveal_all: bool = False) -> InlineKeyboardMarkup:
                 callback_data=f"game:ms:o:{game['id']}:{idx}",
             ))
         rows.append(row)
+    if not reveal_all:
+        if int(game.get("stake") or 0) > 0 and len(state.get("revealed") or []) > 0:
+            rows.append([InlineKeyboardButton(text="💰 Забрать", callback_data=f"game:ms:cash:{game['id']}")])
+        rows.append([InlineKeyboardButton(text="❌ Закрыть игру", callback_data=f"game:ms:close:{game['id']}")])
+    else:
+        rows.append([InlineKeyboardButton(text="🔁 Ещё раз", callback_data=f"games:botrun:ms:{game['stake']}")])
     rows.append([InlineKeyboardButton(text="🎮 Игры", callback_data="games:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1160,16 +1309,22 @@ def _ms_kb(game: dict, reveal_all: bool = False) -> InlineKeyboardMarkup:
 @router.callback_query(F.data.startswith("game:ms:new:"))
 async def cb_ms_new(callback: CallbackQuery):
     stake = int(callback.data.split(":")[3])
+    if stake > 0:
+        await smart_edit(
+            callback,
+            "💣 <b>Сапёр со ставкой</b>\n\n"
+            f"Ставка: <b>{_money(stake)}</b> 🍬\n"
+            "Выбери количество мин. Чем больше мин, тем выше иксы и риск.",
+            reply_markup=_bot_mines_count_kb(stake),
+        )
+        await callback.answer()
+        return
     result = await start_minesweeper(callback.from_user.id, stake)
     if not result["ok"]:
         await callback.answer("Не хватает зефирок для ставки.", show_alert=True)
         return
     game = result["game"]
-    text = (
-        "💣 <b>Сапёр</b>\n\n"
-        f"Ставка: <b>{_money(game['stake'])}</b> 🍬\n"
-        "Поле 4x4, внутри 3 мины. Открой все безопасные клетки."
-    )
+    text = _ms_text(game)
     await smart_edit(callback, text, reply_markup=_ms_kb(game))
     await callback.answer()
 
@@ -1185,28 +1340,45 @@ async def cb_ms_open(callback: CallbackQuery):
     game["state"] = result["state"]
     status = result.get("status", game.get("status"))
     reveal_all = status in ("won", "lost")
-    if status == "lost":
-        text = (
-            "💥 <b>Мина!</b>\n\n"
-            f"Потеря: <b>-{_money(result.get('game', {}).get('stake', 0))}</b> 🍬\n"
-            f"Баланс: <b>{_money(result.get('balance', 0))}</b> 🍬"
-        )
-    elif status == "won":
+    if status == "won":
         item_line = ""
         if result.get("item"):
             item_line = f"\n🎁 Предмет: <b>{result['item']['name']}</b>"
-        text = (
-            "🏆 <b>Победа в сапёре!</b>\n\n"
-            f"Выплата: <b>{_money(result.get('payout', 0))}</b> 🍬\n"
-            f"Итог: <b>{'+' if result.get('delta', 0) > 0 else ''}{_money(result.get('delta', 0))}</b> 🍬\n"
-            f"Баланс: <b>{_money(result.get('balance', 0))}</b> 🍬\n"
-            f"Прибыль к дневному лимиту: <b>{_money(result.get('profit', 0))}</b> 🍬"
-            f"{item_line}"
-        )
+        text = _ms_text(game, result["state"], status, result) + item_line
+    elif status == "lost":
+        text = _ms_text(game, result["state"], status, result)
     else:
-        text = "💣 <b>Сапёр</b>\n\nПродолжай открывать безопасные клетки."
+        text = _ms_text(game, result["state"], status, result)
     await smart_edit(callback, text, reply_markup=_ms_kb(game, reveal_all=reveal_all))
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("game:ms:cash:"))
+async def cb_ms_cashout(callback: CallbackQuery):
+    game_id = callback.data.split(":")[3]
+    result = await cashout_minesweeper(callback.from_user.id, game_id)
+    if not result["ok"]:
+        await callback.answer("Игра уже завершена или недоступна.", show_alert=True)
+        return
+    game = dict(result["game"])
+    game["state"] = result["state"]
+    await smart_edit(callback, _ms_text(game, result["state"], result["status"], result), reply_markup=_ms_kb(game, reveal_all=True))
+    await callback.answer("Забрано")
+
+
+@router.callback_query(F.data.startswith("game:ms:close:"))
+async def cb_ms_close(callback: CallbackQuery):
+    game_id = callback.data.split(":")[3]
+    result = await cashout_minesweeper(callback.from_user.id, game_id, close_only=True)
+    if not result["ok"]:
+        await callback.answer("Игра уже закрыта.", show_alert=True)
+        return
+    game = dict(result["game"])
+    game["state"] = result["state"]
+    await smart_edit(callback, _ms_text(game, result["state"], result["status"], result), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎮 Игры", callback_data="games:home")]
+    ]))
+    await callback.answer("Игра закрыта")
 
 
 @router.callback_query(F.data.startswith("game:dice:"))

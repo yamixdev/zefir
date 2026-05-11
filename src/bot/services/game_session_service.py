@@ -18,7 +18,9 @@ from bot.services.game_logic import (
     is_blackjack,
     make_deck,
     make_hangman_state,
+    mines_cashout,
     mines_make_state,
+    mines_multiplier,
     mines_open,
     rps_winner,
     ttt_apply_move,
@@ -29,6 +31,9 @@ from bot.services.game_logic import (
 
 DATA_DIR = Path(__file__).resolve().parents[3] / "data"
 RANKED_TYPES = {"ttt", "rps", "duel", "blackjack", "quiz"}
+MINES_SIZE = 4
+MINES_MIN = 2
+MINES_MAX = 10
 
 
 def new_session_id() -> str:
@@ -206,6 +211,24 @@ async def _schedule_duel_signal(conn, session_id: str, state: dict) -> None:
     )
 
 
+async def _schedule_mines_start(conn, session_id: str) -> None:
+    await conn.execute(
+        """
+        UPDATE game_scheduled_events
+           SET status = 'cancelled', processed_at = NOW()
+         WHERE session_id = %s AND event_type = 'mines_start' AND status = 'pending'
+        """,
+        (session_id,),
+    )
+    await conn.execute(
+        """
+        INSERT INTO game_scheduled_events (session_id, event_type, run_at, payload)
+        VALUES (%s, 'mines_start', NOW() + INTERVAL '4 seconds', '{}'::jsonb)
+        """,
+        (session_id,),
+    )
+
+
 async def _cancel_scheduled_events(conn, session_id: str) -> None:
     await conn.execute(
         """
@@ -376,6 +399,70 @@ def _blackjack_settlements(state: dict) -> tuple[int | None, str, list[dict], li
     return None, "finished", settlements, _blackjack_final_places(state)
 
 
+def _mines_pick_count(stake: int, players_count: int) -> int:
+    # Mildly weighted random: high stakes can still get safe fields, but risky fields appear a bit more often.
+    base = [2, 3, 4, 5, 6, 7, 8, 9, 10]
+    if stake <= 0:
+        weights = [8, 14, 16, 16, 14, 11, 8, 5, 3]
+    elif stake <= 50:
+        weights = [6, 10, 14, 16, 16, 13, 10, 7, 4]
+    else:
+        weights = [4, 8, 12, 15, 16, 15, 12, 10, 8]
+    return random.choices(base, weights=weights, k=1)[0]
+
+
+def _mines_board_summary(board: dict, stake: int) -> dict:
+    mines_count = int(board.get("mines_count") or len(board.get("mines") or []) or 3)
+    opened = len(board.get("revealed") or [])
+    safe_total = MINES_SIZE * MINES_SIZE - mines_count
+    current_multiplier = mines_multiplier(MINES_SIZE, mines_count, opened, config.mines_rtp) if stake > 0 and opened > 0 else 0
+    next_multiplier = mines_multiplier(MINES_SIZE, mines_count, min(opened + 1, safe_total), config.mines_rtp) if stake > 0 and opened < safe_total else current_multiplier
+    current_payout = mines_cashout(stake, current_multiplier)
+    next_payout = mines_cashout(stake, next_multiplier)
+    return {
+        "mines_count": mines_count,
+        "opened": opened,
+        "safe_total": safe_total,
+        "current_multiplier": current_multiplier,
+        "next_multiplier": next_multiplier,
+        "current_payout": current_payout,
+        "next_payout": next_payout,
+        "current_profit": max(current_payout - stake, 0),
+        "next_profit": max(next_payout - stake, 0),
+    }
+
+
+def _mines_all_done(state: dict, players: list[dict]) -> bool:
+    boards = state.get("boards") or {}
+    for player in players:
+        board = boards.get(str(player["user_id"])) or {}
+        if board.get("status") == "active":
+            return False
+    return True
+
+
+def _mines_final_places(state: dict, players: list[dict]) -> list[dict]:
+    boards = state.get("boards") or {}
+    rows = []
+    for player in players:
+        board = boards.get(str(player["user_id"])) or {}
+        summary = board.get("summary") or {}
+        payout = int(board.get("payout") or summary.get("current_payout") or 0)
+        opened = int(summary.get("opened") or len(board.get("revealed") or []))
+        rows.append((player["user_id"], payout, opened, player["seat"]))
+    rows.sort(key=lambda row: (-row[1], -row[2], row[3]))
+    out = []
+    current_place = 0
+    last_key = None
+    for index, (uid, payout, opened, _) in enumerate(rows, start=1):
+        key = (payout, opened)
+        if key != last_key:
+            current_place = index
+            last_key = key
+        out.append({"user_id": uid, "place": current_place, "score": payout, "response_ms": 0})
+    return out
+
+
 async def _update_locked_session(
     conn,
     session_id: str,
@@ -433,8 +520,20 @@ async def _initial_state(game_type: str, players: list[dict], seed_state: dict |
             }
         return {"deck": deck, "dealer": dealer, "players": player_states, "phase": "playing"}, ids[0]
     if game_type == "mines":
-        boards = {str(p["user_id"]): mines_make_state() for p in players}
-        return {"boards": boards}, None
+        stake = int(seed_state.get("stake") or 0)
+        mines_count = _mines_pick_count(stake, len(players))
+        boards = {}
+        for p in players:
+            board = mines_make_state(MINES_SIZE, mines_count)
+            board["status"] = "preparing"
+            boards[str(p["user_id"])] = board
+        return {
+            "phase": "preparing",
+            "mines_count": mines_count,
+            "boards": boards,
+            "ready_at": (datetime.now(UTC) + timedelta(seconds=4)).isoformat(),
+            "replay_votes": [],
+        }, None
     return {}, ids[0] if ids else None
 
 
@@ -471,6 +570,8 @@ async def create_session(
 
             status = "running" if autostart else "waiting"
             state = {"quiz_count": max(1, min(int(quiz_count or 10), 30))} if game_type == "quiz" else {}
+            if game_type == "mines":
+                state["stake"] = stake
             current_turn = None
             await conn.execute(
                 """
@@ -519,6 +620,8 @@ async def create_session(
                 session = await cur.fetchone()
                 if game_type == "duel":
                     await _schedule_duel_signal(conn, session_id, state)
+                if game_type == "mines":
+                    await _schedule_mines_start(conn, session_id)
             return {"ok": True, "session": await _full(conn, session)}
 
 
@@ -585,6 +688,8 @@ async def join_session(session_id: str, user) -> dict:
                 session = await cur.fetchone()
                 if session["game_type"] == "duel":
                     await _schedule_duel_signal(conn, session_id, state)
+                if session["game_type"] == "mines":
+                    await _schedule_mines_start(conn, session_id)
             else:
                 cur = await conn.execute("SELECT * FROM game_sessions WHERE id = %s", (session_id,))
                 session = await cur.fetchone()
@@ -706,6 +811,8 @@ async def start_session(session_id: str, user_id: int) -> dict:
             session = await cur.fetchone()
             if session["game_type"] == "duel":
                 await _schedule_duel_signal(conn, session_id, state)
+            if session["game_type"] == "mines":
+                await _schedule_mines_start(conn, session_id)
             return {"ok": True, "session": await _full(conn, session)}
 
 
@@ -789,6 +896,65 @@ async def finish_session(session_id: str, winner_id: int | None, result: str = "
             return {"ok": True, "session": await _full(conn, await cur.fetchone())}
 
 
+@with_db_retry
+async def replay_mines_session(session_id: str, user_id: int) -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute("SELECT * FROM game_sessions WHERE id = %s FOR UPDATE", (session_id,))
+            session = await cur.fetchone()
+            if not session or session["game_type"] != "mines" or session["status"] not in ("finished", "draw"):
+                return {"ok": False, "error": "not_available"}
+            players = await _session_players(conn, session_id)
+            if not any(p["user_id"] == user_id for p in players):
+                return {"ok": False, "error": "not_player", "session": await _full(conn, session)}
+            state = dict(session.get("state") or {})
+            votes = set(state.get("replay_votes") or [])
+            votes.add(str(user_id))
+            state["replay_votes"] = sorted(votes)
+            if len(votes) < len(players):
+                cur = await conn.execute(
+                    "UPDATE game_sessions SET state = %s, updated_at = NOW() WHERE id = %s RETURNING *",
+                    (Jsonb(state), session_id),
+                )
+                return {"ok": True, "waiting": True, "session": await _full(conn, await cur.fetchone())}
+
+            for player in players:
+                if not await _spend(conn, player["user_id"], session["stake"], "game_stake", session_id):
+                    state["replay_error"] = f"У игрока {display_name(player)} не хватает зефирок."
+                    cur = await conn.execute(
+                        """
+                        UPDATE game_sessions
+                           SET status = 'cancelled', result = 'replay_not_enough', state = %s, updated_at = NOW()
+                         WHERE id = %s
+                        RETURNING *
+                        """,
+                        (Jsonb(state), session_id),
+                    )
+                    return {"ok": False, "error": "not_enough", "session": await _full(conn, await cur.fetchone())}
+
+            seed = {"stake": session["stake"]}
+            new_state, current_turn = await _initial_state("mines", players, seed, False)
+            cur = await conn.execute(
+                """
+                UPDATE game_sessions
+                   SET status = 'running',
+                       result = NULL,
+                       winner_id = NULL,
+                       state = %s,
+                       current_turn_id = %s,
+                       updated_at = NOW(),
+                       expires_at = %s
+                 WHERE id = %s
+                RETURNING *
+                """,
+                (Jsonb(new_state), current_turn, _expires(), session_id),
+            )
+            session = await cur.fetchone()
+            await _schedule_mines_start(conn, session_id)
+            return {"ok": True, "restarted": True, "session": await _full(conn, session)}
+
+
 async def _finish_locked(
     conn,
     session: dict,
@@ -804,12 +970,12 @@ async def _finish_locked(
         if settlements:
             by_user = {int(item["user_id"]): item for item in settlements}
             for settlement in settlements:
-                payout = session["stake"] * int(settlement.get("payout_multiplier") or 0)
+                payout = int(settlement.get("payout") if settlement.get("payout") is not None else session["stake"] * int(settlement.get("payout_multiplier") or 0))
                 if payout:
                     await _grant(conn, settlement["user_id"], payout, "game_win" if payout > session["stake"] else "game_refund", session_id)
             for player in players:
                 item = by_user.get(player["user_id"], {})
-                payout = session["stake"] * int(item.get("payout_multiplier") or 0)
+                payout = int(item.get("payout") if item.get("payout") is not None else session["stake"] * int(item.get("payout_multiplier") or 0))
                 settlement_rows.append(await _settlement_row(
                     conn,
                     player["user_id"],
@@ -1112,25 +1278,80 @@ async def handle_session_action(session_id: str, user_id: int, action: str, valu
                     answer = "Blackjack завершён"
 
             elif action == "mine" and game_type == "mines":
+                if state.get("phase") == "preparing":
+                    return {"ok": False, "error": "preparing", "session": await _full(conn, session), "answer": "Зефир ещё подбирает поле. Подожди несколько секунд.", "alert": True}
                 boards = dict(state.get("boards") or {})
                 board = boards.get(str(user_id))
                 if not board or board.get("status") != "active":
                     return {"ok": False, "error": "field_done", "session": await _full(conn, session), "answer": "Твоё поле уже завершено.", "alert": True}
+                if value == "cashout":
+                    summary = _mines_board_summary(board, session["stake"])
+                    payout = summary["current_payout"] if summary["opened"] > 0 else session["stake"]
+                    board["status"] = "cashed_out"
+                    board["payout"] = payout
+                    board["summary"] = summary
+                    boards[str(user_id)] = board
+                    state["boards"] = boards
+                    answer = f"Забрано: {payout} 🍬"
+                    if _mines_all_done(state, players):
+                        settlements = []
+                        for player in players:
+                            pboard = boards.get(str(player["user_id"])) or {}
+                            outcome = "won" if pboard.get("status") == "cashed_out" and int(pboard.get("payout") or 0) > session["stake"] else "draw" if int(pboard.get("payout") or 0) == session["stake"] else "lost"
+                            settlements.append({"user_id": player["user_id"], "outcome": outcome, "payout": int(pboard.get("payout") or 0)})
+                        state["final_places"] = _mines_final_places(state, players)
+                        session = await _update_locked_session(conn, session_id, state, None)
+                        session = await _finish_locked(conn, session, players, None, "finished", settlements=settlements)
+                        finished = True
+                    else:
+                        session = await _update_locked_session(conn, session_id, state, None)
+                    return {"ok": True, "session": await _full(conn, session), "finished": finished, "answer": answer, "alert": False}
                 board, status = mines_open(board, int(value))
+                board["summary"] = _mines_board_summary(board, session["stake"])
                 boards[str(user_id)] = board
                 state["boards"] = boards
                 session = await _update_locked_session(conn, session_id, state, None)
                 if status == "repeat":
                     return {"ok": False, "error": "repeat", "session": await _full(conn, session), "answer": "Эта клетка уже открыта.", "alert": True}
                 if status == "lost":
-                    winner = next((p["user_id"] for p in players if p["user_id"] != user_id), None)
-                    session = await _finish_locked(conn, session, players, winner, "finished")
-                    finished = True
-                    return {"ok": True, "session": await _full(conn, session), "finished": True, "answer": "Мина. Игра завершена.", "alert": True}
+                    answer = "Мина. Ставка сгорела."
+                    alert = True
+                    if _mines_all_done(state, players):
+                        settlements = []
+                        for player in players:
+                            pboard = boards.get(str(player["user_id"])) or {}
+                            payout = int(pboard.get("payout") or 0)
+                            outcome = "won" if payout > session["stake"] else "draw" if payout == session["stake"] and payout > 0 else "lost"
+                            settlements.append({"user_id": player["user_id"], "outcome": outcome, "payout": payout})
+                        state["final_places"] = _mines_final_places(state, players)
+                        session = await _update_locked_session(conn, session_id, state, None)
+                        session = await _finish_locked(conn, session, players, None, "finished", settlements=settlements)
+                        finished = True
                 if status == "won":
-                    session = await _finish_locked(conn, session, players, user_id, "finished")
-                    finished = True
+                    summary = _mines_board_summary(board, session["stake"])
+                    board["status"] = "cashed_out"
+                    board["payout"] = summary["current_payout"] if session["stake"] > 0 else 0
+                    board["summary"] = summary
+                    boards[str(user_id)] = board
+                    state["boards"] = boards
+                    if _mines_all_done(state, players):
+                        settlements = []
+                        for player in players:
+                            pboard = boards.get(str(player["user_id"])) or {}
+                            payout = int(pboard.get("payout") or 0)
+                            outcome = "won" if payout > session["stake"] else "draw" if payout == session["stake"] and payout > 0 else "lost"
+                            settlements.append({"user_id": player["user_id"], "outcome": outcome, "payout": payout})
+                        state["final_places"] = _mines_final_places(state, players)
+                        session = await _update_locked_session(conn, session_id, state, None)
+                        session = await _finish_locked(conn, session, players, None, "finished", settlements=settlements)
+                        finished = True
+                    else:
+                        session = await _update_locked_session(conn, session_id, state, None)
                     answer = "Поле очищено!"
+
+            elif action == "replay" and game_type == "mines":
+                if session["status"] == "running":
+                    return {"ok": False, "error": "not_finished", "session": await _full(conn, session), "answer": "Раунд ещё идёт.", "alert": True}
 
             else:
                 return {"ok": False, "error": "unavailable", "session": await _full(conn, session), "answer": "Действие недоступно.", "alert": True}
@@ -1183,6 +1404,63 @@ async def activate_due_duel_signals(limit: int = 20) -> list[dict]:
                         RETURNING *
                         """,
                         (Jsonb(state), session["id"]),
+                    )
+                    session = await cur.fetchone()
+                    activated.append(await _full(conn, session))
+                await conn.execute(
+                    "UPDATE game_scheduled_events SET status = 'processed', processed_at = NOW() WHERE id = %s",
+                    (event["id"],),
+                )
+    return activated
+
+
+@with_db_retry
+async def activate_due_mines_starts(limit: int = 20) -> list[dict]:
+    activated: list[dict] = []
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute(
+                """
+                SELECT *
+                FROM game_scheduled_events
+                WHERE status = 'pending'
+                  AND event_type = 'mines_start'
+                  AND run_at <= NOW()
+                ORDER BY run_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+                """,
+                (limit,),
+            )
+            events = await cur.fetchall()
+            for event in events:
+                cur = await conn.execute("SELECT * FROM game_sessions WHERE id = %s FOR UPDATE", (event["session_id"],))
+                session = await cur.fetchone()
+                if not session or session["status"] != "running" or session["game_type"] != "mines":
+                    await conn.execute(
+                        "UPDATE game_scheduled_events SET status = 'cancelled', processed_at = NOW() WHERE id = %s",
+                        (event["id"],),
+                    )
+                    continue
+                state = dict(session.get("state") or {})
+                if state.get("phase") == "preparing":
+                    boards = dict(state.get("boards") or {})
+                    for uid, board in list(boards.items()):
+                        board = dict(board)
+                        if board.get("status") == "preparing":
+                            board["status"] = "active"
+                        boards[uid] = board
+                    state["boards"] = boards
+                    state["phase"] = "running"
+                    cur = await conn.execute(
+                        """
+                        UPDATE game_sessions
+                           SET state = %s, updated_at = NOW(), expires_at = %s
+                         WHERE id = %s
+                        RETURNING *
+                        """,
+                        (Jsonb(state), _expires(), session["id"]),
                     )
                     session = await cur.fetchone()
                     activated.append(await _full(conn, session))
@@ -1296,7 +1574,7 @@ async def list_my_sessions(user_id: int) -> list[dict]:
             SELECT gs.*
             FROM game_sessions gs
             JOIN game_session_players gsp ON gsp.session_id = gs.id
-            WHERE gsp.user_id = %s AND gs.status IN ('waiting', 'running')
+            WHERE gsp.user_id = %s AND gs.status IN ('waiting', 'running') AND gs.mode <> 'bot'
             ORDER BY gs.updated_at DESC
             LIMIT 10
             """,

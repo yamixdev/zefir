@@ -19,6 +19,7 @@ from bot.keyboards.inline import (
     incident_user_close,
 )
 from bot.services.time_service import format_msk
+from bot.services.rating_service import finalize_active_season
 from bot.models import (
     get_open_tickets, count_open_tickets, get_ticket, update_ticket_status,
     set_ticket_reply, get_all_users, get_user, set_ban,
@@ -405,14 +406,15 @@ async def cb_users_list(callback: CallbackQuery):
 
 def _user_profile_text(user: dict) -> str:
     name = f'{user["first_name"] or ""} {user["last_name"] or ""}'.strip() or "—"
-    ban_status = "🔴 Заблокирован" if user["is_banned"] else "🟢 Активен"
+    access_status = "🔴 забанен" if user["is_banned"] else "🟢 активен"
     bonus = user.get("ai_bonus") or 0
     bonus_line = f"🎁 AI-бонус: <b>+{bonus}</b>\n" if bonus else ""
     link = f'<a href="tg://user?id={user["user_id"]}">Открыть профиль Telegram</a>'
     blocked = user.get("bot_blocked_at")
-    blocked_line = f"\n🚫 Бот в ЧС: <b>{format_msk(blocked)}</b> МСК" if blocked else ""
+    blocked_line = f"\n🚫 Бот в ЧС: <b>{format_msk(blocked)}</b> МСК" if blocked else "\n🚫 Бот в ЧС: <b>нет данных/не заблокирован</b>"
     active = user.get("last_active_at")
-    active_line = f"\n🟢 Последняя активность: <b>{format_msk(active)}</b> МСК" if active else ""
+    active_line = f"\n🕒 Онлайн: был <b>{format_msk(active)}</b> МСК" if active else "\n🕒 Онлайн: данных пока нет"
+    action_line = f"\n🧭 Последнее действие: <code>{html.escape(user.get('last_action') or '—')}</code>"
     reason_line = ""
     if user["is_banned"] and user.get("ban_reason_text"):
         reason_line = f"\nПричина: <i>{html.escape(user['ban_reason_text'])}</i>"
@@ -424,7 +426,7 @@ def _user_profile_text(user: dict) -> str:
         f"🔖 @{user['username'] or '—'}\n"
         f"🆔 <code>{user['user_id']}</code>\n\n"
         f"🔗 {link}\n"
-        f"📌 Статус: {ban_status}{reason_line}{active_line}{blocked_line}\n"
+        f"📌 Доступ: <b>{access_status}</b>{reason_line}{active_line}{action_line}{blocked_line}\n"
         f"🤖 AI использовано: <b>{user['ai_messages_used']}</b> из <b>{config.ai_daily_limit}</b>\n"
         f"{bonus_line}"
         f"📅 Регистрация: {format_msk(user['created_at'], '%d.%m.%Y')}"
@@ -573,6 +575,22 @@ async def cb_admin_online(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "adm:rating_finalize")
+async def cb_admin_rating_finalize(callback: CallbackQuery):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    result = await finalize_active_season(callback.from_user.id)
+    season = result["season"]
+    await callback.message.edit_text(
+        "🏆 <b>Итоги сезона</b>\n\n"
+        f"Сезон: <code>{html.escape(season['code'])}</code>\n"
+        f"Награды доступны с: <b>{format_msk(season['finalized_at'])}</b> МСК",
+        reply_markup=admin_menu(),
+    )
+    await callback.answer("Награды сезона открыты", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("adm:activity:"))
 async def cb_admin_activity(callback: CallbackQuery):
     if not config.is_admin(callback.from_user.id):
@@ -614,7 +632,11 @@ async def cb_probe_user(callback: CallbackQuery, bot: Bot):
         await callback.answer(f"Не удалось проверить: {e.__class__.__name__}", show_alert=True)
     user = await get_user(user_id)
     if user:
-        await callback.message.edit_text(_user_profile_text(user), reply_markup=admin_user_actions(user_id, user["is_banned"]))
+        try:
+            await callback.message.edit_text(_user_profile_text(user), reply_markup=admin_user_actions(user_id, user["is_banned"]))
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                raise
 
 
 @router.callback_query(F.data.regexp(r"^adm:incidents(:\d+)?$"))
@@ -707,7 +729,20 @@ async def process_incident_note(message: Message, state: FSMContext, bot: Bot):
             await bot.send_message(incident["user_id"], user_text, reply_markup=incident_user_close())
         except Exception:
             pass
-    await message.answer(f"✅ Инцидент #{incident_id} закрыт.", reply_markup=admin_menu())
+    prompt_msg_id = data.get("incident_msg_id")
+    done_text = f"✅ <b>Инцидент #{incident_id} закрыт.</b>"
+    if prompt_msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=prompt_msg_id,
+                text=done_text,
+                reply_markup=incident_user_close(),
+            )
+            return
+        except Exception:
+            pass
+    await message.answer(done_text, reply_markup=incident_user_close())
 
 
 # ── Reset AI limits ──────────────────────────────────────────────

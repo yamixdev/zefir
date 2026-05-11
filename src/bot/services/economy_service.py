@@ -823,6 +823,22 @@ async def list_shop_offers(category: str | None = None, limit: int = 10) -> list
 
 
 @with_db_retry
+async def get_shop_offer(offer_id: int) -> dict | None:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT so.id AS offer_id, so.price AS offer_price, so.title, so.is_daily, i.*
+            FROM shop_offers so
+            JOIN items i ON i.id = so.item_id
+            WHERE so.id = %s AND so.is_active = TRUE AND i.is_active = TRUE
+            """,
+            (offer_id,),
+        )
+        return await cur.fetchone()
+
+
+@with_db_retry
 async def get_shop_rotation_status() -> dict:
     pool = await get_pool()
     async with pool.connection() as conn:

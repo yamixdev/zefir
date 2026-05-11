@@ -236,7 +236,10 @@ def admin_menu() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🚨 Инциденты", callback_data="adm:incidents"),
     )
     kb.row(InlineKeyboardButton(text="📰 Новости", callback_data="adm:news"))
-    kb.row(InlineKeyboardButton(text="🍬 Экономика", callback_data="adm:econ"))
+    kb.row(
+        InlineKeyboardButton(text="🍬 Экономика", callback_data="adm:econ"),
+        InlineKeyboardButton(text="🏆 Итоги сезона", callback_data="adm:rating_finalize"),
+    )
     kb.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main"))
     return kb.as_markup()
 
@@ -291,6 +294,7 @@ def admin_users_list(users: list, page: int = 0) -> InlineKeyboardMarkup:
 
 def admin_user_actions(user_id: int, is_banned: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔗 Открыть Telegram", url=f"tg://user?id={user_id}"))
     kb.row(
         InlineKeyboardButton(text="🎁 Начислить AI", callback_data=f"adm:grant_pick:{user_id}"),
         InlineKeyboardButton(text="🔄 Сбросить AI", callback_data=f"adm:resetlim:{user_id}"),

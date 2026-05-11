@@ -12,6 +12,7 @@ from bot.services.economy_service import (
     buy_shop_offer,
     claim_daily_freebie,
     get_daily_freebie_status,
+    get_shop_offer,
     get_shop_rotation_status,
     item_label,
     list_shop_offers,
@@ -50,7 +51,7 @@ def _shop_kb(offers: list[dict], daily_status: dict | None = None) -> InlineKeyb
     for offer in offers[:8]:
         kb.row(InlineKeyboardButton(
             text=f"{RARITY_ICONS.get(offer['rarity'], '▫️')} {offer['name']} — {_money(offer['offer_price'])} 🍬",
-            callback_data=f"shop:buy:{offer['offer_id']}",
+            callback_data=f"shop:item:{offer['offer_id']}",
         ))
     kb.row(InlineKeyboardButton(text="📦 Кейсы", callback_data="econ:cases"))
     kb.row(InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun"))
@@ -87,6 +88,58 @@ async def _shop_text(user_id: int, category: str | None = None) -> tuple[str, li
     return "\n".join(lines), offers, daily
 
 
+def _effect_text(offer: dict) -> str:
+    effects = offer.get("effect_json") or {}
+    parts = []
+    labels = {
+        "hunger": "сытость",
+        "thirst": "жажда",
+        "cleanliness": "чистота",
+        "mood": "настроение",
+        "energy": "энергия",
+        "health": "здоровье",
+        "affection": "привязанность",
+        "xp": "опыт",
+        "ai_bonus": "AI-бонус",
+        "cosmetic_slot": "слот косметики",
+    }
+    for key, label in labels.items():
+        if key in effects:
+            value = effects[key]
+            sign = "+" if isinstance(value, int) and value > 0 else ""
+            parts.append(f"{label}: {sign}{value}")
+    if offer["item_type"] == "cosmetic":
+        parts.append("это косметика: меняет внешний вид питомца")
+    if offer["item_type"] in ("pet_consumable", "pet_boost"):
+        parts.append("расходуется после применения")
+    elif offer["item_type"] in ("pet_toy", "home_item"):
+        parts.append("полезный предмет для питомца/домика")
+    return "\n".join(f"• {html.escape(str(part))}" for part in parts) or "• Подробное действие пока не задано."
+
+
+def _offer_detail_text(offer: dict, balance: int) -> str:
+    description = offer.get("description") or "Описание скоро появится, но предмет уже можно использовать по типу."
+    category = CATEGORY_LABELS.get(offer.get("category") or "all", offer.get("category") or "предмет")
+    return (
+        f"{RARITY_ICONS.get(offer['rarity'], '▫️')} <b>{html.escape(offer['name'])}</b>\n\n"
+        f"{html.escape(description)}\n\n"
+        f"Цена: <b>{_money(offer['offer_price'])}</b> 🍬\n"
+        f"Баланс: <b>{_money(balance)}</b> 🍬\n"
+        f"Редкость: <b>{html.escape(offer['rarity'])}</b>\n"
+        f"Категория: <b>{html.escape(category)}</b>\n"
+        f"Тип: <b>{html.escape(offer['item_type'])}</b>\n"
+        f"Можно продать: <b>{'да' if offer['sellable'] else 'нет'}</b>\n\n"
+        f"<b>Действие:</b>\n{_effect_text(offer)}"
+    )
+
+
+def _offer_detail_kb(offer_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Купить", callback_data=f"shop:buy:{offer_id}:confirm")],
+        [InlineKeyboardButton(text="⬅️ Магазин", callback_data="shop:home")],
+    ])
+
+
 @router.callback_query(F.data == "shop:home")
 async def cb_shop_home(callback: CallbackQuery):
     text, offers, daily = await _shop_text(callback.from_user.id)
@@ -112,7 +165,19 @@ async def cmd_shop(message: Message, bot: Bot):
     await render_clean_message(bot, message.chat.id, message.from_user.id, text, reply_markup=_shop_kb(offers, daily))
 
 
-@router.callback_query(F.data.startswith("shop:buy:"))
+@router.callback_query(F.data.startswith("shop:item:"))
+async def cb_shop_item(callback: CallbackQuery):
+    offer_id = int(callback.data.split(":")[2])
+    offer = await get_shop_offer(offer_id)
+    if not offer:
+        await callback.answer("Предложение уже недоступно.", show_alert=True)
+        return
+    balance = await get_zefirki_balance(callback.from_user.id)
+    await render_clean_callback(callback, _offer_detail_text(offer, balance), reply_markup=_offer_detail_kb(offer_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^shop:buy:\d+:confirm$"))
 async def cb_shop_buy(callback: CallbackQuery):
     offer_id = int(callback.data.split(":")[2])
     result = await buy_shop_offer(callback.from_user.id, offer_id)
@@ -134,6 +199,18 @@ async def cb_shop_buy(callback: CallbackQuery):
         [InlineKeyboardButton(text="🛒 Магазин", callback_data="shop:home")],
     ]))
     await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^shop:buy:\d+$"))
+async def cb_shop_old_buy(callback: CallbackQuery):
+    offer_id = int(callback.data.split(":")[2])
+    offer = await get_shop_offer(offer_id)
+    if not offer:
+        await callback.answer("Предложение уже недоступно.", show_alert=True)
+        return
+    balance = await get_zefirki_balance(callback.from_user.id)
+    await render_clean_callback(callback, _offer_detail_text(offer, balance), reply_markup=_offer_detail_kb(offer_id))
+    await callback.answer("Проверь описание перед покупкой.")
 
 
 @router.callback_query(F.data == "shop:daily_info")

@@ -1,9 +1,12 @@
 from bot.services.game_logic import (
     guess_hangman_letter,
     hand_value,
+    mines_cashout,
     make_hangman_state,
     mines_make_state,
+    mines_multiplier,
     mines_open,
+    mines_survival_probability,
     render_hangman_word,
     rps_winner,
     ttt_apply_move,
@@ -56,3 +59,15 @@ def test_mines_open_lost_or_active():
     state, status = mines_open(state, mine)
     assert status == "lost"
     assert state["status"] == "lost"
+
+
+def test_mines_multiplier_uses_probability_and_rtp():
+    low_risk = mines_multiplier(size=4, mines_count=2, opened_safe=1, rtp=0.92)
+    high_risk = mines_multiplier(size=4, mines_count=10, opened_safe=1, rtp=0.92)
+    deeper = mines_multiplier(size=4, mines_count=5, opened_safe=3, rtp=0.92)
+    first = mines_multiplier(size=4, mines_count=5, opened_safe=1, rtp=0.92)
+
+    assert mines_survival_probability(size=4, mines_count=5, opened_safe=0) == 1.0
+    assert high_risk > low_risk
+    assert deeper > first
+    assert mines_cashout(50, first) == int(50 * first)

@@ -1,5 +1,5 @@
 import random
-from datetime import UTC
+from datetime import UTC, timedelta
 from psycopg.types.json import Jsonb
 
 from bot.db import get_pool, with_db_retry
@@ -71,6 +71,16 @@ PET_MINIGAMES = {
 
 _rng = random.SystemRandom()
 
+REJECT_TEXTS = {
+    "feed": "Питомец уже сыт и аккуратно отодвинул миску. Лучше вернуться к еде чуть позже.",
+    "drink": "Сейчас пить не хочется. Питомец посмотрел на миску и спокойно отошёл.",
+    "wash": "Питомец чистый и не хочет повторять уход прямо сейчас.",
+    "pet": "Питомец немного устал от внимания и хочет пару минут тишины.",
+    "play": "На игру сейчас мало сил. Лучше дать питомцу немного восстановиться.",
+    "sleep": "Питомец пока не хочет спать и устроился наблюдать за комнатой.",
+    "heal": "Сейчас всё в порядке, лишняя забота только нервирует питомца.",
+}
+
 
 def _cap(value: int) -> int:
     return max(0, min(100, value))
@@ -78,6 +88,24 @@ def _cap(value: int) -> int:
 
 def _level_for_xp(xp: int) -> int:
     return max(1, xp // 100 + 1)
+
+
+def _action_unneeded(pet: dict, action: str) -> bool:
+    return (
+        (action == "feed" and pet["hunger"] >= 88)
+        or (action == "drink" and pet["thirst"] >= 88)
+        or (action == "wash" and pet["cleanliness"] >= 88)
+        or (action == "sleep" and pet["energy"] >= 88)
+        or (action == "heal" and pet["health"] >= 88)
+        or (action == "play" and pet["energy"] <= 18)
+        or (action == "pet" and pet["mood"] >= 94 and pet["affection"] >= 85)
+    )
+
+
+def _cooldown_minutes(action: str, pet: dict) -> int:
+    trust = int(pet.get("trust") or 50)
+    base = {"feed": 10, "drink": 8, "wash": 20, "pet": 6, "play": 15, "sleep": 18, "heal": 25}.get(action, 10)
+    return max(4, base - trust // 25)
 
 
 def _aware(value):
@@ -462,7 +490,6 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
     cfg = PET_ACTIONS.get(action)
     if not cfg:
         return {"ok": False, "error": "unknown_action"}
-    action_date = today_msk()
 
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -476,15 +503,48 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
 
             cur = await conn.execute(
                 """
-                INSERT INTO pet_actions (user_id, action, action_date)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (user_id, action, action_date) DO NOTHING
-                RETURNING action
+                SELECT *
+                FROM pet_action_cooldowns
+                WHERE user_id = %s AND pet_id = %s AND action = %s AND until_at > NOW()
                 """,
-                (user_id, action, action_date),
+                (user_id, pet["id"], action),
             )
-            if not await cur.fetchone():
-                return {"ok": False, "error": "already_done", "pet": pet, "action": cfg}
+            cooldown = await cur.fetchone()
+            if cooldown:
+                return {
+                    "ok": False,
+                    "error": "cooldown",
+                    "pet": pet,
+                    "action": cfg,
+                    "until_at": cooldown["until_at"],
+                    "text": cooldown.get("reason") or REJECT_TEXTS.get(action),
+                }
+
+            if _action_unneeded(pet, action):
+                text = REJECT_TEXTS.get(action, "Питомец сейчас не хочет это повторять.")
+                until_at = now_utc() + timedelta(minutes=_cooldown_minutes(action, pet))
+                trust = _cap(int(pet.get("trust") or 50) - 2)
+                cur = await conn.execute(
+                    "UPDATE pets SET trust = %s, updated_at = NOW() WHERE id = %s RETURNING *",
+                    (trust, pet["id"]),
+                )
+                updated = await cur.fetchone()
+                await conn.execute(
+                    """
+                    INSERT INTO pet_action_cooldowns (user_id, pet_id, action, until_at, reason)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, pet_id, action) DO UPDATE
+                        SET until_at = EXCLUDED.until_at,
+                            reason = EXCLUDED.reason,
+                            updated_at = NOW()
+                    """,
+                    (user_id, pet["id"], action, until_at, text),
+                )
+                await conn.execute(
+                    "INSERT INTO pet_actions (user_id, action, action_date) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                    (user_id, f"{action}:rejected", today_msk()),
+                )
+                return {"ok": False, "error": "rejected", "pet": updated, "action": cfg, "text": text, "until_at": until_at}
 
             new_xp = pet["xp"] + cfg["xp"]
             new_level = _level_for_xp(new_xp)
@@ -495,6 +555,7 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
             new_energy = _cap(pet["energy"] + cfg["energy"])
             new_health = _cap(pet["health"] + cfg["health"])
             new_affection = _cap(pet["affection"] + cfg["affection"])
+            new_trust = _cap(int(pet.get("trust") or 50) + (1 if action in ("feed", "drink", "pet", "heal") else 0))
 
             cur = await conn.execute(
                 """
@@ -506,10 +567,11 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
                        cleanliness = %s,
                        mood = %s,
                        energy = %s,
-                        health = %s,
-                        affection = %s,
-                        last_action_at = NOW(),
-                        updated_at = NOW()
+                       health = %s,
+                       affection = %s,
+                       trust = %s,
+                       last_action_at = NOW(),
+                       updated_at = NOW()
                  WHERE id = %s
                  RETURNING *
                 """,
@@ -523,10 +585,15 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
                     new_energy,
                     new_health,
                     new_affection,
+                    new_trust,
                     pet["id"],
                 ),
             )
             updated = await cur.fetchone()
+            await conn.execute(
+                "INSERT INTO pet_actions (user_id, action, action_date) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                (user_id, action, today_msk()),
+            )
             base_level_up = new_level > pet["level"]
             updated, event = await _maybe_pet_event(conn, user_id, action, updated)
             reaction = await _reaction(conn, updated["species"], action, updated)

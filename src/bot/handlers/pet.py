@@ -242,8 +242,11 @@ async def cb_pet_action(callback: CallbackQuery):
     action = callback.data.split(":")[2]
     result = await perform_pet_action(callback.from_user.id, action)
     if not result["ok"]:
-        if result.get("error") == "already_done":
-            await callback.answer("Это действие уже было сегодня.", show_alert=True)
+        if result.get("error") in ("rejected", "cooldown"):
+            await callback.answer(result.get("text") or "Питомец сейчас не хочет это повторять.", show_alert=True)
+            if result.get("pet"):
+                pets = await list_pets(callback.from_user.id)
+                await smart_edit(callback, _pet_text(result["pet"]), reply_markup=_pet_kb(pets))
         elif result.get("error") == "low_energy":
             await callback.answer("Не хватает энергии для тренировки.", show_alert=True)
         elif result.get("error") == "no_pet":

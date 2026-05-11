@@ -749,6 +749,26 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
             UPDATE pets SET last_decay_at = COALESCE(last_decay_at, updated_at, NOW()) WHERE last_decay_at IS NULL;
         """,
     ),
+    (
+        "20260511_002_mines_rating_pet_incident_polish",
+        """
+            ALTER TABLE rating_seasons ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ;
+            ALTER TABLE rating_seasons ADD COLUMN IF NOT EXISTS finalized_by BIGINT REFERENCES users(user_id);
+            ALTER TABLE pets ADD COLUMN IF NOT EXISTS trust INT NOT NULL DEFAULT 50;
+
+            CREATE TABLE IF NOT EXISTS pet_action_cooldowns (
+                user_id    BIGINT NOT NULL REFERENCES users(user_id),
+                pet_id     BIGINT NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+                action     TEXT NOT NULL,
+                until_at   TIMESTAMPTZ NOT NULL,
+                reason     TEXT,
+                updated_at TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (user_id, pet_id, action)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pet_action_cooldowns_due
+                ON pet_action_cooldowns (user_id, pet_id, until_at);
+        """,
+    ),
 )
 
 

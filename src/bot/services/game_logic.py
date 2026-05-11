@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 
@@ -146,10 +147,35 @@ def dice_result(a: int, b: int) -> int:
     return 1 if a > b else 2
 
 
+def mines_survival_probability(size: int, mines_count: int, opened_safe: int) -> float:
+    total = size * size
+    safe = total - mines_count
+    opened_safe = max(0, min(int(opened_safe), safe))
+    if opened_safe == 0:
+        return 1.0
+    if mines_count <= 0 or mines_count >= total:
+        return 0.0
+    return math.comb(safe, opened_safe) / math.comb(total, opened_safe)
+
+
+def mines_multiplier(size: int, mines_count: int, opened_safe: int, rtp: float = 0.92) -> float:
+    probability = mines_survival_probability(size, mines_count, opened_safe)
+    if probability <= 0:
+        return 0.0
+    return max(1.0, (1 / probability) * float(rtp))
+
+
+def mines_cashout(stake: int, multiplier: float) -> int:
+    if stake <= 0:
+        return 0
+    return max(0, int(stake * multiplier))
+
+
 def mines_make_state(size: int = 4, mines_count: int = 3) -> dict:
     cells = list(range(size * size))
     return {
         "size": size,
+        "mines_count": mines_count,
         "mines": sorted(random.sample(cells, mines_count)),
         "revealed": [],
         "status": "active",

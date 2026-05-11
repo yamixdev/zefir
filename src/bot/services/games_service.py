@@ -7,11 +7,14 @@ from psycopg.types.json import Jsonb
 from bot.config import config
 from bot.db import get_pool, with_db_retry
 from bot.services.economy_service import _add_inventory, _log_event
+from bot.services.game_logic import mines_cashout, mines_multiplier
 from bot.services.time_service import today_msk
 
 
 MS_SIZE = 4
 MS_MINES = 3
+MS_MINES_MIN = 2
+MS_MINES_MAX = 10
 TTT_WINS = (
     (0, 1, 2), (3, 4, 5), (6, 7, 8),
     (0, 3, 6), (1, 4, 7), (2, 5, 8),
@@ -101,6 +104,40 @@ async def _record_pve_profit(conn, user_id: int, amount: int, game_id: str) -> N
     )
 
 
+def _normalize_mines_count(stake: int, mines_count: int | None) -> int:
+    if stake <= 0:
+        return MS_MINES
+    return max(MS_MINES_MIN, min(int(mines_count or MS_MINES), MS_MINES_MAX))
+
+
+def minesweeper_summary(game: dict, state: dict | None = None) -> dict:
+    state = state or game.get("state") or {}
+    stake = int(game.get("stake") or 0)
+    mines_count = int(state.get("mines_count") or len(state.get("mines") or []) or MS_MINES)
+    opened = len(state.get("revealed") or [])
+    current_multiplier = mines_multiplier(MS_SIZE, mines_count, opened, config.mines_rtp) if stake > 0 and opened > 0 else 0
+    current_payout = mines_cashout(stake, current_multiplier)
+    safe_total = MS_SIZE * MS_SIZE - mines_count
+    if opened < safe_total:
+        next_multiplier = mines_multiplier(MS_SIZE, mines_count, opened + 1, config.mines_rtp) if stake > 0 else 0
+        next_payout = mines_cashout(stake, next_multiplier)
+    else:
+        next_multiplier = current_multiplier
+        next_payout = current_payout
+    return {
+        "stake": stake,
+        "mines_count": mines_count,
+        "opened": opened,
+        "safe_total": safe_total,
+        "current_multiplier": current_multiplier,
+        "current_payout": current_payout,
+        "current_profit": max(current_payout - stake, 0),
+        "next_multiplier": next_multiplier,
+        "next_payout": next_payout,
+        "next_profit": max(next_payout - stake, 0),
+    }
+
+
 async def _maybe_game_key_drop(conn, user_id: int, game_id: str, stake: int) -> dict | None:
     if stake <= 0:
         return None
@@ -126,12 +163,13 @@ async def _maybe_game_key_drop(conn, user_id: int, game_id: str, stake: int) -> 
 
 
 @with_db_retry
-async def start_minesweeper(user_id: int, stake: int = 0) -> dict:
+async def start_minesweeper(user_id: int, stake: int = 0, mines_count: int | None = None) -> dict:
     stake = max(0, min(int(stake), 100))
+    mines_count = _normalize_mines_count(stake, mines_count)
     game_id = _game_id()
     cells = list(range(MS_SIZE * MS_SIZE))
-    mines = sorted(_rng.sample(cells, MS_MINES))
-    state = {"mines": mines, "revealed": []}
+    mines = sorted(_rng.sample(cells, mines_count))
+    state = {"mines": mines, "mines_count": mines_count, "revealed": []}
 
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -268,6 +306,7 @@ async def open_minesweeper_cell(user_id: int, game_id: str, index: int) -> dict:
 
             state = game["state"]
             mines = list(state["mines"])
+            mines_count = int(state.get("mines_count") or len(mines) or MS_MINES)
             revealed = set(state.get("revealed") or [])
             if index in revealed:
                 return {"ok": True, "game": game, "state": state, "repeat": True}
@@ -278,14 +317,16 @@ async def open_minesweeper_cell(user_id: int, game_id: str, index: int) -> dict:
                     "UPDATE pve_games SET status = 'lost', state = %s, updated_at = NOW() WHERE id = %s",
                     (Jsonb(state), game_id),
                 )
-                return {"ok": True, "status": "lost", "game": game, "state": state, "payout": 0, "delta": -game["stake"], "balance": await _balance(conn, user_id)}
+                return {"ok": True, "status": "lost", "game": game, "state": state, "payout": 0, "delta": -game["stake"], "balance": await _balance(conn, user_id), "summary": minesweeper_summary(game, state)}
 
             revealed.add(index)
             state["revealed"] = sorted(revealed)
-            safe_total = MS_SIZE * MS_SIZE - MS_MINES
+            safe_total = MS_SIZE * MS_SIZE - mines_count
             if len(revealed) >= safe_total:
                 cap = await _remaining_pve_profit_cap(conn, user_id)
-                profit = min(game["stake"], cap) if game["stake"] > 0 else 0
+                summary = minesweeper_summary(game, state)
+                raw_profit = summary["current_profit"]
+                profit = min(raw_profit, cap) if game["stake"] > 0 else 0
                 payout = game["stake"] + profit if game["stake"] else profit
                 if payout > 0:
                     await _grant_zefirki(conn, user_id, payout, "game_win", game_id)
@@ -318,6 +359,7 @@ async def open_minesweeper_cell(user_id: int, game_id: str, index: int) -> dict:
                     "delta": payout - game["stake"],
                     "balance": await _balance(conn, user_id),
                     "item": item,
+                    "summary": minesweeper_summary(game, state),
                 }
 
             await conn.execute(
@@ -326,7 +368,63 @@ async def open_minesweeper_cell(user_id: int, game_id: str, index: int) -> dict:
             )
             cur = await conn.execute("SELECT * FROM pve_games WHERE id = %s", (game_id,))
             updated = await cur.fetchone()
-            return {"ok": True, "status": "active", "game": updated, "state": state}
+            return {"ok": True, "status": "active", "game": updated, "state": state, "summary": minesweeper_summary(updated, state), "balance": await _balance(conn, user_id)}
+
+
+@with_db_retry
+async def cashout_minesweeper(user_id: int, game_id: str, close_only: bool = False) -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute("SELECT * FROM pve_games WHERE id = %s FOR UPDATE", (game_id,))
+            game = await cur.fetchone()
+            if not game or game["user_id"] != user_id or game["status"] != "active":
+                return {"ok": False, "error": "not_active"}
+            state = dict(game["state"] or {})
+            summary = minesweeper_summary(game, state)
+            stake = int(game["stake"] or 0)
+            opened = int(summary["opened"])
+            status = "cancelled"
+            payout = 0
+            profit = 0
+            result = "cancelled"
+            if stake > 0 and opened == 0:
+                payout = stake
+                result = "refund"
+                await _grant_zefirki(conn, user_id, payout, "game_refund", game_id)
+            elif stake > 0 and opened > 0:
+                cap = await _remaining_pve_profit_cap(conn, user_id)
+                profit = min(summary["current_profit"], cap)
+                payout = stake + profit
+                status = "cashed_out"
+                result = "cashout"
+                await _grant_zefirki(conn, user_id, payout, "game_win" if profit else "game_refund", game_id)
+                await _record_pve_profit(conn, user_id, profit, game_id)
+            state["cashout"] = {
+                "result": result,
+                "payout": payout,
+                "profit": profit,
+                "delta": payout - stake,
+            }
+            await conn.execute(
+                "UPDATE pve_games SET status = %s, state = %s, updated_at = NOW() WHERE id = %s",
+                (status, Jsonb(state), game_id),
+            )
+            cur = await conn.execute("SELECT * FROM pve_games WHERE id = %s", (game_id,))
+            updated = await cur.fetchone()
+            return {
+                "ok": True,
+                "status": status,
+                "result": result,
+                "game": updated,
+                "state": state,
+                "payout": payout,
+                "profit": profit,
+                "delta": payout - stake,
+                "balance": await _balance(conn, user_id),
+                "summary": summary,
+                "closed": close_only,
+            }
 
 
 def minesweeper_cell_text(index: int, state: dict, reveal_all: bool = False) -> str:
@@ -393,7 +491,7 @@ async def list_user_active_games(user_id: int) -> dict:
         cur = await conn.execute(
             """
             SELECT * FROM pve_games
-            WHERE user_id = %s AND status = 'active'
+            WHERE user_id = %s AND status = 'active' AND game_type <> 'minesweeper'
             ORDER BY created_at DESC
             LIMIT 5
             """,

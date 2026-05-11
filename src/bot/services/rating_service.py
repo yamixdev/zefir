@@ -278,6 +278,30 @@ async def get_ranked_leaderboard(limit: int = 10) -> dict:
         return {"season": season, "rows": await cur.fetchall()}
 
 
+def season_rewards_available(season: dict) -> bool:
+    return bool(season.get("finalized_at") or season["ends_at"] <= now_msk())
+
+
+@with_db_retry
+async def finalize_active_season(admin_id: int) -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            season = await _active_season(conn)
+            cur = await conn.execute(
+                """
+                UPDATE rating_seasons
+                   SET finalized_at = COALESCE(finalized_at, NOW()),
+                       finalized_by = COALESCE(finalized_by, %s),
+                       status = CASE WHEN ends_at <= NOW() THEN 'finished' ELSE status END
+                 WHERE id = %s
+                 RETURNING *
+                """,
+                (admin_id, season["id"]),
+            )
+            return {"ok": True, "season": await cur.fetchone()}
+
+
 def reward_for_place(place: int, elo: int, games: int) -> tuple[int, str | None]:
     if place == 1:
         return 1000, "season_crown_legend"
@@ -298,14 +322,16 @@ async def claim_season_reward(user_id: int) -> dict:
                 """
                 SELECT *
                 FROM rating_seasons
-                WHERE ends_at <= NOW()
-                ORDER BY ends_at DESC
+                WHERE ends_at <= NOW() OR finalized_at IS NOT NULL
+                ORDER BY COALESCE(finalized_at, ends_at) DESC
                 LIMIT 1
                 """
             )
             season = await cur.fetchone()
             if not season:
                 return {"ok": False, "error": "no_finished_season"}
+            if not season_rewards_available(season):
+                return {"ok": False, "error": "season_active"}
 
             cur = await conn.execute(
                 """

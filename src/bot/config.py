@@ -31,6 +31,7 @@ class Config:
     ranked_k_factor: int = int(os.getenv("RANKED_K_FACTOR", "32"))
     ranked_min_reward_games: int = int(os.getenv("RANKED_MIN_REWARD_GAMES", "3"))
     max_game_stake: int = int(os.getenv("MAX_GAME_STAKE", "100"))
+    mines_rtp: float = float(os.getenv("MINES_RTP", "0.92"))
     bot_release_version: str = os.getenv("BOT_RELEASE_VERSION", "2026-05-09")
     news_notification_hours: int = int(os.getenv("NEWS_NOTIFICATION_HOURS", "8"))
     quiz_ai_enabled: bool = os.getenv("QUIZ_AI_ENABLED", "1") != "0"

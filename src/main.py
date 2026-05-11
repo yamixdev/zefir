@@ -90,7 +90,7 @@ async def on_error(event: ErrorEvent, bot: Bot):
         action,
         exc_info=(type(event.exception), event.exception, event.exception.__traceback__),
     )
-    from bot.keyboards.inline import admin_incident_actions
+    from bot.keyboards.inline import admin_incident_actions, incident_user_close
     from bot.models import create_incident
 
     incident_id = await create_incident(
@@ -107,6 +107,7 @@ async def on_error(event: ErrorEvent, bot: Bot):
             await bot.send_message(
                 chat_id,
                 f"⚠️ Произошла ошибка. Инцидент #{incident_id} передан владельцу, я постараюсь не потерять контекст.",
+                reply_markup=incident_user_close(),
             )
         except Exception:
             pass
