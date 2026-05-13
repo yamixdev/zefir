@@ -51,6 +51,7 @@ from bot.services.game_session_service import (
     activate_due_duel_signals,
     activate_due_mines_starts,
     cancel_session,
+    close_session,
     create_session,
     display_name,
     expire_session_by_id,
@@ -62,7 +63,7 @@ from bot.services.game_session_service import (
     load_quiz_questions,
     list_my_sessions,
     list_open_sessions,
-    replay_mines_session,
+    replay_session,
     set_session_message,
     start_session,
 )
@@ -188,7 +189,7 @@ GAME_LABELS = {
 }
 
 
-RANKED_TYPES = {"ttt", "rps", "duel", "blackjack", "quiz"}
+RANKED_TYPES = {"ttt", "rps", "duel", "blackjack", "quiz", "mines"}
 
 
 def _mode_kb(game_type: str) -> InlineKeyboardMarkup:
@@ -447,7 +448,7 @@ async def cb_pvp_create(callback: CallbackQuery):
         await callback.answer()
         return
     quiz_count = 15 if game_type == "quiz" and ranked else None
-    min_players = 1 if game_type in {"quiz", "hangman", "blackjack"} else 2
+    min_players = 2
     max_players = 6 if game_type in {"quiz", "hangman", "blackjack"} else 2
     if ranked:
         min_players = 2
@@ -484,7 +485,7 @@ async def cb_pvp_create_quiz_count(callback: CallbackQuery):
         callback.message.chat.id,
         stake=stake,
         ranked=False,
-        min_players=1,
+        min_players=2,
         max_players=6,
         quiz_count=count,
     )
@@ -500,6 +501,7 @@ async def cb_pvp_create_quiz_count(callback: CallbackQuery):
 
 @router.callback_query(F.data == "games:sessions:list")
 async def cb_sessions_list(callback: CallbackQuery):
+    await process_due_game_events(callback.bot, limit=20)
     sessions = await list_open_sessions(limit=10)
     kb = InlineKeyboardBuilder()
     if not sessions:
@@ -570,6 +572,7 @@ async def cb_games_rating_claim(callback: CallbackQuery):
 
 @router.callback_query(F.data == "games:active")
 async def cb_games_active(callback: CallbackQuery):
+    await process_due_game_events(callback.bot, limit=20)
     await expire_stale_sessions(limit=30)
     await expire_stale_ttt_rooms(limit=30)
     data = await list_user_active_games(callback.from_user.id)
@@ -724,12 +727,13 @@ def _quiz_top_ids(session: dict, use_speed: bool = False) -> list[int]:
 def _session_text(session: dict, viewer_id: int) -> str:
     label = GAME_LABELS.get(session["game_type"], session["game_type"])
     if session["status"] == "waiting":
+        players_count = len(session.get("players") or [])
         return (
             f"🎮 <b>{label}</b>\n\n"
             f"Код комнаты: <code>{session['id']}</code> или <code>/join {session['id']}</code>\n"
             f"Режим: <b>{_session_mode_text(session)}</b>\n\n"
             f"<b>Игроки:</b>\n{_players_text(session)}\n\n"
-            f"Нужно игроков: <b>{session['min_players']}</b>"
+            f"Игроков: <b>{players_count}/{session['max_players']}</b>, старт от <b>{session['min_players']}</b>"
         )
     if session["status"] in ("finished", "draw", "cancelled", "expired"):
         status = {
@@ -880,11 +884,13 @@ def _session_kb(session: dict, viewer_id: int) -> InlineKeyboardMarkup:
             rows.append([InlineKeyboardButton(text="▶️ Начать", callback_data=f"game:{session['id']}:start:x")])
         if session["creator_id"] == viewer_id:
             rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"game:{session['id']}:cancel:x")])
+        elif _is_session_player(session, viewer_id):
+            rows.append([InlineKeyboardButton(text="🚪 Выйти", callback_data=f"game:{session['id']}:close:x")])
         rows.append([InlineKeyboardButton(text="⬅️ Игры", callback_data="games:home")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
     if session["status"] != "running":
         rows = []
-        if session["game_type"] == "mines" and session["status"] in ("finished", "draw"):
+        if _is_session_player(session, viewer_id) and session["status"] in ("finished", "draw"):
             rows.append([InlineKeyboardButton(text="🔁 Ещё раз", callback_data=f"game:{session['id']}:replay:x")])
         rows.append([InlineKeyboardButton(text="🎮 Игры", callback_data="games:home")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -951,6 +957,8 @@ def _session_kb(session: dict, viewer_id: int) -> InlineKeyboardMarkup:
                     rows.append([InlineKeyboardButton(text="💰 Забрать", callback_data=f"game:{session['id']}:mine:cashout")])
     if session.get("mode") != "bot":
         rows.append([InlineKeyboardButton(text="💬 Сообщение", callback_data=f"game:{session['id']}:chat:x")])
+    if _is_session_player(session, viewer_id):
+        rows.append([InlineKeyboardButton(text="🚪 Закрыть/сдаться", callback_data=f"game:{session['id']}:close:x")])
     rows.append([InlineKeyboardButton(text="🎮 Игры", callback_data="games:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1075,9 +1083,10 @@ def _quiz_score_for_answer(state_data: dict, correct_place: int) -> tuple[int, i
     return (speed_points + place_bonus) * multiplier, elapsed_ms
 
 
-@router.callback_query(F.data.regexp(r"^game:[a-z0-9]{5,10}:(join|start|cancel|chat):"))
+@router.callback_query(F.data.regexp(r"^game:[a-z0-9]{5,10}:(join|start|cancel|close|chat):"))
 async def cb_session_control(callback: CallbackQuery, state: FSMContext):
     _, session_id, action, _ = callback.data.split(":", 3)
+    await process_due_game_events(callback.bot, limit=20)
     if action == "join":
         result = await join_session(session_id, callback.from_user)
         if not result["ok"]:
@@ -1113,6 +1122,15 @@ async def cb_session_control(callback: CallbackQuery, state: FSMContext):
         await _sync_session_messages(callback.bot, result["session"])
         await callback.answer("Комната отменена")
         return
+    if action == "close":
+        result = await close_session(session_id, callback.from_user.id)
+        if not result["ok"]:
+            await callback.answer("Закрыть сейчас нельзя: партия со ставкой уже идёт или комната недоступна.", show_alert=True)
+            return
+        await _sync_session_messages(callback.bot, result["session"])
+        await smart_edit(callback, _session_text(result["session"], callback.from_user.id), reply_markup=_session_kb(result["session"], callback.from_user.id))
+        await callback.answer("Готово")
+        return
     if action == "chat":
         session = await get_session(session_id)
         if not session or not _is_session_player(session, callback.from_user.id):
@@ -1131,6 +1149,7 @@ async def cb_session_control(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.regexp(r"^game:[a-z0-9]{5,10}:(ttt|rps|duel|dice|quiz|quiznext|quizai|hm|bj|mine):"))
 async def cb_session_action(callback: CallbackQuery):
     _, session_id, action, value = callback.data.split(":", 3)
+    await process_due_game_events(callback.bot, limit=20)
     if action == "quizai":
         session = await get_session(session_id)
         if not session or session["game_type"] != "quiz":
@@ -1180,6 +1199,7 @@ async def cb_session_action(callback: CallbackQuery):
 async def cb_session_noop(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     session_id = callback.data.split(":")[1]
+    await process_due_game_events(callback.bot, limit=20)
     session = await get_session(session_id)
     if session:
         await smart_edit(callback, _session_text(session, callback.from_user.id), reply_markup=_session_kb(session, callback.from_user.id))
@@ -1189,7 +1209,7 @@ async def cb_session_noop(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.regexp(r"^game:[a-z0-9]{5,10}:replay:"))
 async def cb_session_replay(callback: CallbackQuery):
     session_id = callback.data.split(":")[1]
-    result = await replay_mines_session(session_id, callback.from_user.id)
+    result = await replay_session(session_id, callback.from_user.id)
     session = result.get("session")
     if session:
         await _sync_session_messages(callback.bot, session)

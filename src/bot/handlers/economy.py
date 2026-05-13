@@ -18,11 +18,14 @@ from bot.services.economy_service import (
     cancel_listing,
     create_listing,
     get_case_rewards,
+    get_case_key_counts,
     get_inventory,
     get_inventory_item,
     get_market_listing,
     get_my_listings,
+    item_action_hint,
     item_label,
+    item_type_label,
     list_cases,
     list_market,
     open_case,
@@ -43,20 +46,6 @@ def _money(n: int) -> str:
 
 
 PAGE_SIZE = 6
-
-ITEM_TYPE_LABELS = {
-    "cosmetic": "косметика",
-    "ai_bonus": "AI-бонус",
-    "pet_boost": "буст питомца",
-    "pet_consumable": "расходник питомца",
-    "pet_toy": "игрушка питомца",
-    "home_item": "предмет домика",
-    "case_key": "ключ от кейса",
-    "unlock": "предмет открытия",
-    "game_ticket": "игровой предмет",
-    "collectible": "коллекционный предмет",
-}
-
 
 def _page_items(items: list[dict], page: int) -> list[dict]:
     start = max(0, page) * PAGE_SIZE
@@ -136,6 +125,13 @@ def _case_open_kb(case_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✅ Хватит", callback_data="econ:cases")],
         [InlineKeyboardButton(text="🎒 Инвентарь", callback_data="econ:inv")],
     ])
+
+
+def _keys_line(keys: dict) -> str:
+    bronze = int((keys.get("bronze_key") or {}).get("quantity") or 0)
+    silver = int((keys.get("silver_key") or {}).get("quantity") or 0)
+    gold = int((keys.get("gold_key") or {}).get("quantity") or 0)
+    return f"Ключи: бронза <b>{bronze}</b> · серебро <b>{silver}</b> · золото <b>{gold}</b>"
 
 
 def _market_kb(listings: list[dict], rarity: str | None = None, category: str | None = None, page: int = 0) -> InlineKeyboardMarkup:
@@ -242,19 +238,11 @@ async def cb_item_detail(callback: CallbackQuery):
         await callback.answer("Предмет не найден в инвентаре", show_alert=True)
         return
     min_price, max_price = price_limits_for(item)
-    action_hint = "Меняет внешний вид активного питомца." if item["item_type"] == "cosmetic" else (
-        "Ставится в домик питомцев." if item["item_type"] == "home_item" else (
-            "Открывает кейс, где указан этот ключ." if item["item_type"] == "case_key" else (
-                "Открывает дополнительного питомца при нужном уровне." if item["item_type"] == "unlock" else (
-                    "Можно использовать из инвентаря." if item["usable"] else "Можно оставить в коллекции или продать, если предмет продаётся."
-                )
-            )
-        )
-    )
+    action_hint = item_action_hint(item)
     text = (
         f"{item_label(item)}\n\n"
         f"Редкость: <b>{RARITY_LABELS.get(item['rarity'], item['rarity'])}</b>\n"
-        f"Тип: <b>{html.escape(ITEM_TYPE_LABELS.get(item['item_type'], item['item_type']))}</b>\n"
+        f"Тип: <b>{html.escape(item_type_label(item['item_type']))}</b>\n"
         f"Действие: <b>{html.escape(action_hint)}</b>\n"
         f"Количество: <b>{item['quantity']}</b>\n"
         f"Базовая цена: <b>{_money(item['base_price'])}</b> 🍬\n"
@@ -378,9 +366,11 @@ async def msg_listing_price(message: Message, state: FSMContext, bot: Bot):
 async def cb_cases(callback: CallbackQuery):
     cases = await list_cases()
     balance = await get_zefirki_balance(callback.from_user.id)
+    keys = await get_case_key_counts(callback.from_user.id)
     text = (
         "📦 <b>Кейсы</b>\n\n"
         f"Баланс: <b>{_money(balance)}</b> 🍬\n"
+        f"{_keys_line(keys)}\n"
         "Обычные кейсы открываются за зефирки. Сундуки требуют ключ и выдают один предмет."
     )
     await smart_edit(callback, text, reply_markup=_cases_kb(cases))
@@ -395,11 +385,12 @@ async def cmd_cases(message: Message, bot: Bot):
         pass
     cases = await list_cases()
     balance = await get_zefirki_balance(message.from_user.id)
+    keys = await get_case_key_counts(message.from_user.id)
     await render_clean_message(
         bot,
         message.chat.id,
         message.from_user.id,
-        f"📦 <b>Кейсы</b>\n\nБаланс: <b>{_money(balance)}</b> 🍬",
+        f"📦 <b>Кейсы</b>\n\nБаланс: <b>{_money(balance)}</b> 🍬\n{_keys_line(keys)}",
         reply_markup=_cases_kb(cases),
     )
 
@@ -413,6 +404,10 @@ async def cb_case_detail(callback: CallbackQuery):
         await callback.answer("Кейс недоступен", show_alert=True)
         return
     rewards = await get_case_rewards(case_id)
+    keys = await get_case_key_counts(callback.from_user.id)
+    key_count = 0
+    if case.get("key_code"):
+        key_count = int((keys.get(case["key_code"]) or {}).get("quantity") or 0)
     if rewards:
         loot_lines = ["\n<b>Внутри:</b>"]
         for reward in rewards:
@@ -423,11 +418,14 @@ async def cb_case_detail(callback: CallbackQuery):
         loot_text = "\n".join(loot_lines)
     else:
         loot_text = "\n<b>Внутри:</b>\nПока нет активного лута."
+    key_text = "не нужен"
+    if case.get("key_name"):
+        key_text = f"{case['key_name']} · у тебя {key_count} шт."
     text = (
         f"📦 <b>{html.escape(case['name'])}</b>\n\n"
         f"{html.escape(case['description'] or '')}\n\n"
         f"Цена: <b>{_money(case['price'])}</b> 🍬\n"
-        f"Ключ: <b>{html.escape(case.get('key_name') or 'не нужен')}</b>"
+        f"Ключ: <b>{html.escape(key_text)}</b>"
         f"{loot_text}"
     )
     await smart_edit(callback, text, reply_markup=_case_detail_kb(case_id))
@@ -446,8 +444,10 @@ async def cb_open_case(callback: CallbackQuery):
             )
         elif result.get("error") == "no_key":
             case = result.get("case") or {}
+            keys = await get_case_key_counts(callback.from_user.id)
+            key_count = int((keys.get(case.get("key_code")) or {}).get("quantity") or 0)
             await callback.answer(
-                f"Нужен ключ: {case.get('key_name') or 'ключ от кейса'}",
+                f"Нужен ключ: {case.get('key_name') or 'ключ от кейса'}. У тебя: {key_count}.",
                 show_alert=True,
             )
         else:

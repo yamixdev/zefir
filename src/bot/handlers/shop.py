@@ -14,7 +14,9 @@ from bot.services.economy_service import (
     get_daily_freebie_status,
     get_shop_offer,
     get_shop_rotation_status,
+    item_action_hint,
     item_label,
+    item_type_label,
     list_shop_offers,
 )
 from bot.services.time_service import format_msk
@@ -114,6 +116,10 @@ def _effect_text(offer: dict) -> str:
         parts.append("расходуется после применения")
     elif offer["item_type"] in ("pet_toy", "home_item"):
         parts.append("полезный предмет для питомца/домика")
+    elif offer["item_type"] == "case_key":
+        parts.append("ключ для открытия специального кейса")
+    elif offer["item_type"] == "collectible":
+        parts.append("коллекционный предмет: можно хранить или продать")
     return "\n".join(f"• {html.escape(str(part))}" for part in parts) or "• Подробное действие пока не задано."
 
 
@@ -127,9 +133,10 @@ def _offer_detail_text(offer: dict, balance: int) -> str:
         f"Баланс: <b>{_money(balance)}</b> 🍬\n"
         f"Редкость: <b>{html.escape(offer['rarity'])}</b>\n"
         f"Категория: <b>{html.escape(category)}</b>\n"
-        f"Тип: <b>{html.escape(offer['item_type'])}</b>\n"
+        f"Тип: <b>{html.escape(item_type_label(offer['item_type']))}</b>\n"
         f"Можно продать: <b>{'да' if offer['sellable'] else 'нет'}</b>\n\n"
-        f"<b>Действие:</b>\n{_effect_text(offer)}"
+        f"<b>Действие:</b> {html.escape(item_action_hint(offer))}\n"
+        f"{_effect_text(offer)}"
     )
 
 

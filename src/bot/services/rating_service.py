@@ -278,6 +278,25 @@ async def get_ranked_leaderboard(limit: int = 10) -> dict:
         return {"season": season, "rows": await cur.fetchall()}
 
 
+@with_db_retry
+async def get_active_season_admin_summary() -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        season = await _active_season(conn)
+        cur = await conn.execute(
+            """
+            SELECT
+                COUNT(*) AS players,
+                COUNT(*) FILTER (WHERE games >= %s) AS eligible_players
+            FROM user_ratings
+            WHERE season_id = %s
+            """,
+            (config.ranked_min_reward_games, season["id"]),
+        )
+        stats = await cur.fetchone()
+        return {"season": season, "stats": stats}
+
+
 def season_rewards_available(season: dict) -> bool:
     return bool(season.get("finalized_at") or season["ends_at"] <= now_msk())
 
@@ -288,11 +307,13 @@ async def finalize_active_season(admin_id: int) -> dict:
     async with pool.connection() as conn:
         async with conn.transaction():
             season = await _active_season(conn)
+            if season.get("finalized_at"):
+                return {"ok": True, "already_finalized": True, "season": season}
             cur = await conn.execute(
                 """
                 UPDATE rating_seasons
-                   SET finalized_at = COALESCE(finalized_at, NOW()),
-                       finalized_by = COALESCE(finalized_by, %s),
+                   SET finalized_at = NOW(),
+                       finalized_by = %s,
                        status = CASE WHEN ends_at <= NOW() THEN 'finished' ELSE status END
                  WHERE id = %s
                  RETURNING *

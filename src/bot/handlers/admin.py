@@ -6,7 +6,7 @@ from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from bot.config import config
 
@@ -19,7 +19,7 @@ from bot.keyboards.inline import (
     incident_user_close,
 )
 from bot.services.time_service import format_msk
-from bot.services.rating_service import finalize_active_season
+from bot.services.rating_service import finalize_active_season, get_active_season_admin_summary
 from bot.models import (
     get_open_tickets, count_open_tickets, get_ticket, update_ticket_status,
     set_ticket_reply, get_all_users, get_user, set_ban,
@@ -580,8 +580,56 @@ async def cb_admin_rating_finalize(callback: CallbackQuery):
     if not config.is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
+    summary = await get_active_season_admin_summary()
+    season = summary["season"]
+    stats = summary["stats"]
+    finalized_at = season.get("finalized_at")
+    if finalized_at:
+        text = (
+            "🏆 <b>Итоги сезона</b>\n\n"
+            f"Сезон: <code>{html.escape(season['code'])}</code>\n"
+            f"Статус: <b>итоги уже подведены</b>\n"
+            f"Награды доступны с: <b>{format_msk(finalized_at)}</b> МСК\n\n"
+            f"Игроков в сезоне: <b>{stats['players']}</b>\n"
+            f"Могут получить награду: <b>{stats['eligible_players']}</b>"
+        )
+        await callback.message.edit_text(text, reply_markup=admin_menu())
+        await callback.answer("Итоги уже подведены", show_alert=True)
+        return
+
+    text = (
+        "🏆 <b>Итоги сезона</b>\n\n"
+        f"Сезон: <code>{html.escape(season['code'])}</code>\n"
+        f"Конец сезона: <b>{format_msk(season['ends_at'])}</b> МСК\n"
+        "Статус: <b>награды ещё закрыты</b>\n\n"
+        f"Игроков в сезоне: <b>{stats['players']}</b>\n"
+        f"Могут получить награду: <b>{stats['eligible_players']}</b>\n\n"
+        "Нажми подтверждение только если точно хочешь открыть награды сейчас."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить итоги", callback_data="adm:rating_finalize_confirm")],
+        [InlineKeyboardButton(text="⬅️ Админ-панель", callback_data="adm:menu")],
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "adm:rating_finalize_confirm")
+async def cb_admin_rating_finalize_confirm(callback: CallbackQuery):
+    if not config.is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
     result = await finalize_active_season(callback.from_user.id)
     season = result["season"]
+    if result.get("already_finalized"):
+        await callback.answer("Итоги уже подведены", show_alert=True)
+        await callback.message.edit_text(
+            "🏆 <b>Итоги сезона</b>\n\n"
+            f"Сезон: <code>{html.escape(season['code'])}</code>\n"
+            f"Награды уже доступны с: <b>{format_msk(season['finalized_at'])}</b> МСК",
+            reply_markup=admin_menu(),
+        )
+        return
     await callback.message.edit_text(
         "🏆 <b>Итоги сезона</b>\n\n"
         f"Сезон: <code>{html.escape(season['code'])}</code>\n"

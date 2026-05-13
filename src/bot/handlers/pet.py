@@ -64,18 +64,32 @@ def _pet_kb(pets: list[dict] | None = None) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="💧 Вода", callback_data="pet:act:drink"),
     )
     kb.row(
-        InlineKeyboardButton(text="🧼 Мыть", callback_data="pet:act:wash"),
         InlineKeyboardButton(text="🎾 Играть", callback_data="pet:minigame:random"),
+        InlineKeyboardButton(text="⋯ Ещё", callback_data="pet:more"),
+    )
+    kb.row(InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun"))
+    return kb.as_markup()
+
+
+def _pet_more_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text="🧼 Мыть", callback_data="pet:act:wash"),
+        InlineKeyboardButton(text="🤍 Гладить", callback_data="pet:act:pet"),
     )
     kb.row(
-        InlineKeyboardButton(text="🤍 Гладить", callback_data="pet:act:pet"),
         InlineKeyboardButton(text="💤 Спать", callback_data="pet:act:sleep"),
+        InlineKeyboardButton(text="🩹 Забота", callback_data="pet:act:heal"),
     )
-    kb.row(InlineKeyboardButton(text="🩹 Забота", callback_data="pet:act:heal"))
-    kb.row(InlineKeyboardButton(text="🏠 Домик", callback_data="pet:home:view"))
-    kb.row(InlineKeyboardButton(text="✏️ Имя", callback_data="pet:rename"))
-    kb.row(InlineKeyboardButton(text="🎒 Предметы для питомца", callback_data="econ:inv:c:food"))
-    kb.row(InlineKeyboardButton(text="⬅️ В развлечения", callback_data="menu:fun"))
+    kb.row(
+        InlineKeyboardButton(text="🏠 Домик", callback_data="pet:home:view"),
+        InlineKeyboardButton(text="✏️ Имя", callback_data="pet:rename"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🎒 Еда", callback_data="econ:inv:c:food"),
+        InlineKeyboardButton(text="💧 Напитки", callback_data="econ:inv:c:drink"),
+    )
+    kb.row(InlineKeyboardButton(text="🐾 К питомцу", callback_data="pet:home"))
     return kb.as_markup()
 
 
@@ -153,6 +167,26 @@ async def cb_pet_home(callback: CallbackQuery):
         await callback.answer()
         return
     await smart_edit(callback, _pet_text(pet), reply_markup=_pet_kb(pets))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "pet:more")
+async def cb_pet_more(callback: CallbackQuery):
+    pet = await get_pet(callback.from_user.id)
+    if not pet:
+        await smart_edit(
+            callback,
+            "🐾 <b>Выбор питомца</b>\n\nДля начала выбери первого спутника.",
+            reply_markup=_species_kb(),
+        )
+        await callback.answer("Сначала выбери питомца.", show_alert=True)
+        return
+    await smart_edit(
+        callback,
+        f"🐾 <b>{html.escape(pet['name'])}</b> · дополнительные действия\n\n"
+        "Здесь уход, домик, имя и предметы. Основные действия оставлены на главном экране питомца.",
+        reply_markup=_pet_more_kb(),
+    )
     await callback.answer()
 
 
@@ -244,9 +278,6 @@ async def cb_pet_action(callback: CallbackQuery):
     if not result["ok"]:
         if result.get("error") in ("rejected", "cooldown"):
             await callback.answer(result.get("text") or "Питомец сейчас не хочет это повторять.", show_alert=True)
-            if result.get("pet"):
-                pets = await list_pets(callback.from_user.id)
-                await smart_edit(callback, _pet_text(result["pet"]), reply_markup=_pet_kb(pets))
         elif result.get("error") == "low_energy":
             await callback.answer("Не хватает энергии для тренировки.", show_alert=True)
         elif result.get("error") == "no_pet":
@@ -271,6 +302,8 @@ async def cb_pet_action(callback: CallbackQuery):
     extra = ""
     if result.get("reaction"):
         extra += f"\n\n<i>{html.escape(result['reaction'])}</i>"
+    if result.get("used_item"):
+        extra += f"\n\n🍱 Использован предмет: {item_label(result['used_item'])}"
     if result["level_up"]:
         extra += "\n\n🎉 Уровень питомца вырос!"
     if result.get("item"):
@@ -284,9 +317,10 @@ async def cb_pet_action(callback: CallbackQuery):
             bonus_parts.append(f"+{event['zefirki']} 🍬")
         bonus = f"\nБонус: <b>{', '.join(bonus_parts)}</b>" if bonus_parts else ""
         extra += f"\n\n🎲 <b>Случайное событие</b>\n<i>{html.escape(event['text'])}</i>{bonus}"
+    reward_line = f"\nНаграда: <b>+{result['zefirki']}</b> 🍬" if result["zefirki"] else ""
     text = (
-        f"🐾 Ты выбрал действие: <b>{action_cfg['label']}</b>\n"
-        f"Награда: <b>+{result['zefirki']}</b> 🍬{extra}\n\n"
+        f"🐾 Действие: <b>{action_cfg['label']}</b>"
+        f"{reward_line}{extra}\n\n"
         f"{_pet_text(pet)}"
     )
     await smart_edit(callback, text, reply_markup=_pet_kb(pets))

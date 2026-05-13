@@ -51,12 +51,56 @@ CATEGORY_LABELS = {
     "collectible": "редкое",
 }
 
+ITEM_TYPE_LABELS = {
+    "cosmetic": "косметика",
+    "ai_bonus": "AI-бонус",
+    "pet_boost": "буст питомца",
+    "pet_consumable": "расходник для питомца",
+    "pet_toy": "игрушка питомца",
+    "home_item": "предмет домика",
+    "case_key": "ключ от кейса",
+    "unlock": "предмет открытия",
+    "game_ticket": "игровой предмет",
+    "collectible": "коллекционный предмет",
+    "material": "материал",
+}
+
 _rng = random.SystemRandom()
 
 
 def item_label(item: dict) -> str:
     icon = RARITY_ICONS.get(item.get("rarity"), "▫️")
     return f"{icon} {item['name']}"
+
+
+def item_type_label(item_type: str | None) -> str:
+    return ITEM_TYPE_LABELS.get(item_type or "", item_type or "предмет")
+
+
+def item_action_hint(item: dict) -> str:
+    item_type = item.get("item_type")
+    effects = item.get("effect_json") or {}
+    if item_type == "cosmetic":
+        slot = effects.get("cosmetic_slot")
+        return f"Косметика для питомца{f' · слот: {slot}' if slot else ''}. Не расходуется."
+    if item_type in ("pet_consumable", "pet_boost"):
+        return "Расходник для питомца. После применения исчезает и меняет состояние."
+    if item_type == "pet_toy":
+        return "Игрушка для питомца. Помогает настроению, опыту или мини-играм."
+    if item_type == "home_item":
+        room = effects.get("room")
+        return f"Предмет домика{f' · комната: {room}' if room else ''}. Устанавливается в жилище."
+    if item_type == "case_key":
+        return "Ключ от кейса. Нужен для открытия сундуков и капсул."
+    if item_type == "ai_bonus":
+        return "Даёт дополнительные AI-запросы."
+    if item_type == "unlock":
+        return "Открывает новый слот или возможность, если выполнены условия."
+    if item_type == "collectible":
+        return "Коллекционный предмет. Можно хранить, продать или использовать в будущих обменах."
+    if item_type == "material":
+        return "Материал для обмена или будущего крафта."
+    return "Можно оставить в коллекции или продать, если предмет продаётся."
 
 
 def price_limits_for(item: dict) -> tuple[int, int]:
@@ -188,6 +232,29 @@ async def get_inventory_item(user_id: int, item_id: int) -> dict | None:
             (user_id, item_id),
         )
         return await cur.fetchone()
+
+
+@with_db_retry
+async def get_case_key_counts(user_id: int) -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            """
+            SELECT i.id, i.code, i.name, COALESCE(ui.quantity, 0) AS quantity
+            FROM items i
+            LEFT JOIN user_inventory ui ON ui.item_id = i.id AND ui.user_id = %s
+            WHERE i.code IN ('bronze_key', 'silver_key', 'gold_key') AND i.is_active = TRUE
+            ORDER BY CASE i.code
+                WHEN 'bronze_key' THEN 1
+                WHEN 'silver_key' THEN 2
+                WHEN 'gold_key' THEN 3
+                ELSE 4
+            END
+            """,
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+    return {row["code"]: dict(row) for row in rows}
 
 
 @with_db_retry

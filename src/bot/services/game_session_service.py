@@ -4,12 +4,12 @@ import json
 import random
 import secrets
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 from psycopg.types.json import Jsonb
 
 from bot.config import config
 from bot.db import get_pool, with_db_retry
+from bot.services.data_service import data_path
 from bot.services.game_logic import (
     RPS_CHOICES,
     dice_result,
@@ -29,8 +29,7 @@ from bot.services.game_logic import (
 )
 
 
-DATA_DIR = Path(__file__).resolve().parents[3] / "data"
-RANKED_TYPES = {"ttt", "rps", "duel", "blackjack", "quiz"}
+RANKED_TYPES = {"ttt", "rps", "duel", "blackjack", "quiz", "mines"}
 MINES_SIZE = 4
 MINES_MIN = 2
 MINES_MAX = 10
@@ -49,14 +48,14 @@ def display_name(player: dict) -> str:
 
 
 def load_quiz_questions(count: int = 10) -> list[dict]:
-    with (DATA_DIR / "quiz_questions.json").open("r", encoding="utf-8") as f:
+    with data_path("quiz_questions.json").open("r", encoding="utf-8") as f:
         questions = json.load(f)
     random.shuffle(questions)
     return questions[:count]
 
 
 def load_hangman_word() -> str:
-    with (DATA_DIR / "hangman_words_ru.json").open("r", encoding="utf-8") as f:
+    with data_path("hangman_words_ru.json").open("r", encoding="utf-8") as f:
         words = json.load(f)
     return random.choice(words)
 
@@ -178,6 +177,7 @@ def _expires(minutes: int | None = None) -> datetime:
 
 def _quiz_state(count: int, ranked: bool = False, questions: list[dict] | None = None) -> dict:
     return {
+        "quiz_count": count,
         "questions": questions if questions is not None else load_quiz_questions(count),
         "index": 0,
         "scores": {},
@@ -463,6 +463,11 @@ def _mines_final_places(state: dict, players: list[dict]) -> list[dict]:
     return out
 
 
+def _ranked_result_session_id(session: dict) -> str:
+    round_no = int((session.get("state") or {}).get("ranked_round") or 1)
+    return session["id"] if round_no <= 1 else f"{session['id']}:r{round_no}"
+
+
 async def _update_locked_session(
     conn,
     session_id: str,
@@ -552,8 +557,8 @@ async def create_session(
 ) -> dict:
     user_id = creator.id
     username, first_name = player_name(creator)
+    ranked = bool(ranked and mode != "bot" and game_type in RANKED_TYPES)
     stake = 0 if ranked else max(0, min(int(stake), config.max_game_stake))
-    ranked = bool(ranked and game_type in RANKED_TYPES)
     pool = await get_pool()
     async with pool.connection() as conn:
         async with conn.transaction():
@@ -748,6 +753,58 @@ async def cancel_session(session_id: str, user_id: int) -> dict:
 
 
 @with_db_retry
+async def close_session(session_id: str, user_id: int) -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute("SELECT * FROM game_sessions WHERE id = %s FOR UPDATE", (session_id,))
+            session = await cur.fetchone()
+            if not session or session["status"] not in ("waiting", "running"):
+                return {"ok": False, "error": "not_available"}
+            players = await _session_players(conn, session_id)
+            if not any(p["user_id"] == user_id for p in players):
+                return {"ok": False, "error": "not_player", "session": await _full(conn, session)}
+
+            if session["status"] == "waiting":
+                if session["creator_id"] == user_id:
+                    for player in players:
+                        await _grant(conn, player["user_id"], session["stake"], "game_refund", session_id)
+                    cur = await conn.execute(
+                        """
+                        UPDATE game_sessions
+                           SET status = 'cancelled', result = 'cancelled', updated_at = NOW()
+                         WHERE id = %s
+                        RETURNING *
+                        """,
+                        (session_id,),
+                    )
+                    await _cancel_scheduled_events(conn, session_id)
+                    return {"ok": True, "session": await _full(conn, await cur.fetchone())}
+
+                await _grant(conn, user_id, session["stake"], "game_refund", session_id)
+                await conn.execute(
+                    "DELETE FROM game_session_players WHERE session_id = %s AND user_id = %s",
+                    (session_id, user_id),
+                )
+                cur = await conn.execute(
+                    "UPDATE game_sessions SET updated_at = NOW(), expires_at = %s WHERE id = %s RETURNING *",
+                    (_expires(), session_id),
+                )
+                return {"ok": True, "session": await _full(conn, await cur.fetchone()), "left": True}
+
+            if session["mode"] == "bot" or session["stake"] == 0:
+                session = await _finish_locked(conn, session, players, None, "draw")
+                return {"ok": True, "session": await _full(conn, session)}
+
+            if len(players) == 2:
+                winner = next((p["user_id"] for p in players if p["user_id"] != user_id), None)
+                session = await _finish_locked(conn, session, players, winner, "finished")
+                return {"ok": True, "session": await _full(conn, session)}
+
+            return {"ok": False, "error": "stake_running_party", "session": await _full(conn, session)}
+
+
+@with_db_retry
 async def expire_session_by_id(session_id: str) -> dict:
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -856,18 +913,19 @@ async def finish_session(session_id: str, winner_id: int | None, result: str = "
                         0,
                         0,
                     ))
-            if session["ranked"] and session["game_type"] in RANKED_TYPES:
+            if session["ranked"] and session["mode"] != "bot" and session["game_type"] in RANKED_TYPES:
+                ranked_session_id = _ranked_result_session_id(session)
                 if session["game_type"] == "quiz" and len(players) >= 2:
                     from bot.services.rating_service import apply_ranked_placements
 
                     placements = (session.get("state") or {}).get("final_places") or []
                     if placements:
-                        await apply_ranked_placements(session_id, session["game_type"], placements)
+                        await apply_ranked_placements(ranked_session_id, session["game_type"], placements)
                 elif len(players) == 2:
                     from bot.services.rating_service import apply_ranked_result
 
                     await apply_ranked_result(
-                        session_id,
+                        ranked_session_id,
                         session["game_type"],
                         players[0]["user_id"],
                         players[1]["user_id"],
@@ -955,6 +1013,71 @@ async def replay_mines_session(session_id: str, user_id: int) -> dict:
             return {"ok": True, "restarted": True, "session": await _full(conn, session)}
 
 
+@with_db_retry
+async def replay_session(session_id: str, user_id: int) -> dict:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            cur = await conn.execute("SELECT * FROM game_sessions WHERE id = %s FOR UPDATE", (session_id,))
+            session = await cur.fetchone()
+            if not session or session["status"] not in ("finished", "draw"):
+                return {"ok": False, "error": "not_available"}
+            players = await _session_players(conn, session_id)
+            if not any(p["user_id"] == user_id for p in players):
+                return {"ok": False, "error": "not_player", "session": await _full(conn, session)}
+
+            state = dict(session.get("state") or {})
+            votes = set(state.get("replay_votes") or [])
+            votes.add(str(user_id))
+            state["replay_votes"] = sorted(votes)
+            if len(votes) < len(players):
+                cur = await conn.execute(
+                    "UPDATE game_sessions SET state = %s, updated_at = NOW() WHERE id = %s RETURNING *",
+                    (Jsonb(state), session_id),
+                )
+                return {"ok": True, "waiting": True, "session": await _full(conn, await cur.fetchone())}
+
+            for player in players:
+                if not await _spend(conn, player["user_id"], session["stake"], "game_stake", session_id):
+                    state["replay_error"] = f"У игрока {display_name(player)} не хватает зефирок."
+                    cur = await conn.execute(
+                        """
+                        UPDATE game_sessions
+                           SET status = 'cancelled', result = 'replay_not_enough', state = %s, updated_at = NOW()
+                         WHERE id = %s
+                        RETURNING *
+                        """,
+                        (Jsonb(state), session_id),
+                    )
+                    return {"ok": False, "error": "not_enough", "session": await _full(conn, await cur.fetchone())}
+
+            quiz_count = int(state.get("quiz_count") or (15 if session["ranked"] and session["game_type"] == "quiz" else 10))
+            seed = {"stake": session["stake"], "quiz_count": quiz_count}
+            new_state, current_turn = await _initial_state(session["game_type"], players, seed, session["ranked"])
+            new_state["ranked_round"] = int(state.get("ranked_round") or 1) + 1
+            cur = await conn.execute(
+                """
+                UPDATE game_sessions
+                   SET status = 'running',
+                       result = NULL,
+                       winner_id = NULL,
+                       state = %s,
+                       current_turn_id = %s,
+                       updated_at = NOW(),
+                       expires_at = %s
+                 WHERE id = %s
+                RETURNING *
+                """,
+                (Jsonb(new_state), current_turn, _expires(), session_id),
+            )
+            session = await cur.fetchone()
+            if session["game_type"] == "duel":
+                await _schedule_duel_signal(conn, session_id, new_state)
+            if session["game_type"] == "mines":
+                await _schedule_mines_start(conn, session_id)
+            return {"ok": True, "restarted": True, "session": await _full(conn, session)}
+
+
 async def _finish_locked(
     conn,
     session: dict,
@@ -1031,21 +1154,22 @@ async def _finish_locked(
 
 
 async def _apply_ranked_after_finish(session: dict) -> None:
-    if not session or not session.get("ranked") or session.get("game_type") not in RANKED_TYPES:
+    if not session or session.get("mode") == "bot" or not session.get("ranked") or session.get("game_type") not in RANKED_TYPES:
         return
     players = session.get("players") or []
-    if session["game_type"] in ("quiz", "blackjack") and len(players) >= 2:
+    ranked_session_id = _ranked_result_session_id(session)
+    if session["game_type"] in ("quiz", "blackjack", "mines") and len(players) >= 2:
         placements = (session.get("state") or {}).get("final_places") or []
         if placements:
             from bot.services.rating_service import apply_ranked_placements
 
-            await apply_ranked_placements(session["id"], session["game_type"], placements)
+            await apply_ranked_placements(ranked_session_id, session["game_type"], placements)
         return
     if len(players) == 2:
         from bot.services.rating_service import apply_ranked_result
 
         await apply_ranked_result(
-            session["id"],
+            ranked_session_id,
             session["game_type"],
             players[0]["user_id"],
             players[1]["user_id"],

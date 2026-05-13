@@ -8,8 +8,8 @@ from bot.services.time_service import today_msk, now_utc
 
 
 PET_ACTIONS = {
-    "feed": {"label": "дать перекус", "hunger": 10, "thirst": -2, "cleanliness": -1, "mood": 3, "energy": 0, "health": 0, "affection": 1, "xp": 7, "zefirki": 0},
-    "drink": {"label": "напоить", "hunger": 0, "thirst": 14, "cleanliness": 0, "mood": 2, "energy": 1, "health": 1, "affection": 1, "xp": 5, "zefirki": 0},
+    "feed": {"label": "дать перекус", "hunger": 25, "thirst": -2, "cleanliness": -1, "mood": 4, "energy": 1, "health": 0, "affection": 2, "xp": 7, "zefirki": 0},
+    "drink": {"label": "напоить", "hunger": 0, "thirst": 30, "cleanliness": 0, "mood": 3, "energy": 2, "health": 1, "affection": 2, "xp": 5, "zefirki": 0},
     "wash": {"label": "помыть", "hunger": -2, "thirst": 0, "cleanliness": 24, "mood": -2, "energy": -3, "health": 2, "affection": 1, "xp": 8, "zefirki": 0},
     "pet": {"label": "погладить", "hunger": 0, "thirst": 0, "cleanliness": 0, "mood": 10, "energy": 3, "health": 0, "affection": 6, "xp": 6, "zefirki": 0},
     "play": {"label": "поиграть", "hunger": -5, "thirst": -5, "cleanliness": -3, "mood": 16, "energy": -10, "health": 0, "affection": 3, "xp": 12, "zefirki": 1},
@@ -106,6 +106,29 @@ def _cooldown_minutes(action: str, pet: dict) -> int:
     trust = int(pet.get("trust") or 50)
     base = {"feed": 10, "drink": 8, "wash": 20, "pet": 6, "play": 15, "sleep": 18, "heal": 25}.get(action, 10)
     return max(4, base - trust // 25)
+
+
+async def _auto_pet_item(conn, user_id: int, category: str) -> dict | None:
+    cur = await conn.execute(
+        """
+        SELECT ui.quantity, i.*
+        FROM user_inventory ui
+        JOIN items i ON i.id = ui.item_id
+        WHERE ui.user_id = %s
+          AND ui.quantity > 0
+          AND i.is_active = TRUE
+          AND i.category = %s
+          AND i.item_type IN ('pet_consumable', 'pet_boost')
+        ORDER BY CASE i.rarity
+            WHEN 'legendary' THEN 1 WHEN 'epic' THEN 2 WHEN 'rare' THEN 3
+            WHEN 'uncommon' THEN 4 WHEN 'common' THEN 5 WHEN 'trash' THEN 6
+            ELSE 99 END, i.base_price DESC, i.name
+        LIMIT 1
+        FOR UPDATE OF ui
+        """,
+        (user_id, category),
+    )
+    return await cur.fetchone()
 
 
 def _aware(value):
@@ -546,15 +569,32 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
                 )
                 return {"ok": False, "error": "rejected", "pet": updated, "action": cfg, "text": text, "until_at": until_at}
 
-            new_xp = pet["xp"] + cfg["xp"]
+            used_item = None
+            item_effects = {}
+            if action in ("feed", "drink"):
+                used_item = await _auto_pet_item(conn, user_id, "food" if action == "feed" else "drink")
+                if used_item:
+                    item_effects = used_item.get("effect_json") or {}
+                    await conn.execute(
+                        """
+                        UPDATE user_inventory
+                           SET quantity = quantity - 1,
+                               updated_at = NOW()
+                         WHERE user_id = %s AND item_id = %s AND quantity > 0
+                        """,
+                        (user_id, used_item["id"]),
+                    )
+                    await _log_event(conn, user_id, 0, "pet_auto_item", item_id=used_item["id"], meta={"action": action})
+
+            new_xp = pet["xp"] + cfg["xp"] + int(item_effects.get("xp", 0))
             new_level = _level_for_xp(new_xp)
-            new_hunger = _cap(pet["hunger"] + cfg["hunger"])
-            new_thirst = _cap(pet["thirst"] + cfg["thirst"])
-            new_cleanliness = _cap(pet["cleanliness"] + cfg["cleanliness"])
-            new_mood = _cap(pet["mood"] + cfg["mood"])
-            new_energy = _cap(pet["energy"] + cfg["energy"])
-            new_health = _cap(pet["health"] + cfg["health"])
-            new_affection = _cap(pet["affection"] + cfg["affection"])
+            new_hunger = _cap(pet["hunger"] + cfg["hunger"] + int(item_effects.get("hunger", 0)))
+            new_thirst = _cap(pet["thirst"] + cfg["thirst"] + int(item_effects.get("thirst", 0)))
+            new_cleanliness = _cap(pet["cleanliness"] + cfg["cleanliness"] + int(item_effects.get("cleanliness", 0)))
+            new_mood = _cap(pet["mood"] + cfg["mood"] + int(item_effects.get("mood", 0)))
+            new_energy = _cap(pet["energy"] + cfg["energy"] + int(item_effects.get("energy", 0)))
+            new_health = _cap(pet["health"] + cfg["health"] + int(item_effects.get("health", 0)))
+            new_affection = _cap(pet["affection"] + cfg["affection"] + int(item_effects.get("affection", 0)))
             new_trust = _cap(int(pet.get("trust") or 50) + (1 if action in ("feed", "drink", "pet", "heal") else 0))
 
             cur = await conn.execute(
@@ -611,14 +651,14 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
                 await _log_event(conn, user_id, reward, "pet_action", meta={"action": action})
 
             item = None
-            drop_roll = _rng.randint(1, 100)
-            if drop_roll <= 32:
+            drop_roll = _rng.randint(1, 1000)
+            if drop_roll <= 80:
                 key_code = None
-                if drop_roll <= 5:
+                if drop_roll <= 2:
                     key_code = "gold_key"
-                elif drop_roll <= 12:
+                elif drop_roll <= 9:
                     key_code = "silver_key"
-                elif drop_roll <= 22:
+                elif drop_roll <= 29:
                     key_code = "bronze_key"
                 key_filter = "code = %s" if key_code else "rarity IN ('common', 'uncommon')"
                 params = (key_code,) if key_code else ()
@@ -644,6 +684,7 @@ async def perform_pet_action(user_id: int, action: str) -> dict:
                 "action": cfg,
                 "zefirki": reward,
                 "item": item,
+                "used_item": used_item,
                 "reaction": reaction,
                 "event": event,
                 "level_up": base_level_up or bool(event and event.get("level_up")),

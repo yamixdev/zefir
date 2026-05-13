@@ -109,3 +109,22 @@ async def test_blackjack_settles_each_player_against_dealer(conn):
     assert finished["winner_id"] == 531
     assert balance_winner == 110
     assert balance_loser == 90
+
+
+async def test_bot_mode_cannot_create_ranked_session(conn):
+    await create_user(conn, 541, zefirki=100)
+
+    created = await create_session(
+        "blackjack",
+        FakeUser(541),
+        541,
+        ranked=True,
+        mode="bot",
+        autostart=True,
+        min_players=1,
+        max_players=1,
+    )
+
+    assert created["ok"] is True
+    assert created["session"]["mode"] == "bot"
+    assert created["session"]["ranked"] is False
